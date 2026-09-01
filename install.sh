@@ -3,18 +3,15 @@
 #
 #   ./install.sh                    poller + banners clicaveis com historico
 #   ./install.sh --no-notifier      so banner de aviso, sem instalar nada
-#   ./install.sh --no-icon          nao personaliza o icone do banner
 #   ./install.sh --org minhaorg     triagem restrita a outra org do GitHub
 set -euo pipefail
 
 ORG=""          # sem default: detectado ou exigido, ver abaixo
 WANT_TN=1        # banners clicaveis + historico na Central: default
-WANT_ICON=1      # banner com nome e icone proprios: default
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-notifier) WANT_TN=1 ;;
     --no-notifier)   WANT_TN=0 ;;
-    --no-icon)       WANT_ICON=0 ;;
     --org) shift; ORG="${1:?--org precisa de um valor}" ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "opcao desconhecida: $1" >&2; exit 2 ;;
@@ -73,46 +70,27 @@ gh api "/notifications?per_page=1" >/dev/null 2>&1 \
   || die "seu token nao le /notifications. rode: gh auth refresh -s notifications"
 ok "acesso a /notifications confirmado"
 
-# ---- banner clicavel ------------------------------------------------------
+# ---- notificador -----------------------------------------------------------
+# Notificador proprio: ~120 linhas de Swift sobre o UserNotifications da Apple,
+# sem dependencia externa. Compila com o swiftc do Command Line Tools e sai
+# universal (arm64 + x86_64), entao o mesmo build serve Apple Silicon e Intel.
+#
 # Exige UMA concessao de permissao por pessoa: o macOS pede consentimento do
 # usuario para qualquer app postar notificacao, e isso nao e pre-concedivel.
 # Sem a permissao o poller cai no osascript, que notifica mas nao clica.
 if [ "$WANT_TN" = "1" ]; then
-  if command -v brew >/dev/null && ! [ -d /opt/homebrew/opt/terminal-notifier ] \
-     && ! [ -d /usr/local/opt/terminal-notifier ]; then
-    info "instalando terminal-notifier"
-    brew install terminal-notifier >/dev/null 2>&1 || info "falhou; o osascript cobre"
-  fi
-  # O Launch Services NAO indexa /opt/homebrew/Cellar, e o macOS nao deixa um
-  # app desconhecido pedir autorizacao de notificacao. Sem copiar para
-  # ~/Applications e registrar, o terminal-notifier retorna exit 3 para sempre
-  # e o `tccutil reset` que a mensagem de erro sugere falha por nao achar
-  # registro nenhum.
-  for TNAPP in /opt/homebrew/opt/terminal-notifier/terminal-notifier.app \
-               /usr/local/opt/terminal-notifier/terminal-notifier.app; do
-    if [ -d "$TNAPP" ]; then
-      mkdir -p "$HOME/Applications"
-      rm -rf "$HOME/Applications/terminal-notifier.app"
-      cp -R "$TNAPP" "$HOME/Applications/" 2>/dev/null || true
-      [ -x "$LSREG" ] && "$LSREG" -f "$HOME/Applications/terminal-notifier.app" 2>/dev/null || true
-      ok "terminal-notifier registrado em ~/Applications"
-      break
-    fi
-  done
-
-  # Copia com nome e icone proprios: o banner aparece como "gh-inbox" em vez de
-  # "terminal-notifier". A 3.0.0 removeu a flag -appIcon porque o icone sempre
-  # vem do bundle que envia, entao a unica via e um bundle proprio.
-  if [ "$WANT_ICON" = "1" ] && [ -f "$SRC/assets/icon.svg" ] && [ -x "$SRC/make-icon.sh" ]; then
-    if "$SRC/make-icon.sh" >/dev/null 2>&1; then
-      ok "banner personalizado (~/Applications/gh-inbox.app)"
-      NOTIFIER_BUNDLE="io.github.fernandamsouza.gh-inbox"
-    else
-      info "nao consegui personalizar o icone; segue com o padrao"
-    fi
+  if ! command -v swiftc >/dev/null; then
+    info "swiftc nao encontrado (xcode-select --install); banner sem clique"
+    WANT_TN=0
+  elif "$SRC/notifier/build.sh" >/dev/null 2>&1; then
+    ok "notificador compilado (~/Applications/gh-inbox.app, universal)"
+    NOTIFIER_BUNDLE="io.github.fernandamsouza.gh-inbox"
+  else
+    info "build do notificador falhou; banner sem clique (o osascript cobre)"
+    WANT_TN=0
   fi
 fi
-NOTIFIER_BUNDLE="${NOTIFIER_BUNDLE:-fr.julienxx.oss.terminal-notifier}"
+NOTIFIER_BUNDLE="${NOTIFIER_BUNDLE:-io.github.fernandamsouza.gh-inbox}"
 
 # ---- arquivos -------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$SKILL_DIR" "$STATE_DIR" "$HOME/Library/LaunchAgents"
@@ -174,8 +152,7 @@ if [ "$WANT_TN" = "1" ]; then
   # macOS abrir o prompt de permissao NA HORA, com a pessoa ainda no terminal.
   # Sem isto o prompt so apareceria no primeiro evento real do GitHub, horas
   # depois e fora de contexto — ou, se o estado ja estiver negado, nunca.
-  TNBIN="$HOME/Applications/gh-inbox.app/Contents/MacOS/terminal-notifier"
-  [ -x "$TNBIN" ] || TNBIN="$HOME/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier"
+  TNBIN="$HOME/Applications/gh-inbox.app/Contents/MacOS/notifier"
   if [ -x "$TNBIN" ]; then
     echo "  Vai aparecer um pedido de permissao de notificacao. Clique em Permitir."
     echo

@@ -109,14 +109,17 @@ OSA=$(find_bin osascript) || die "osascript nao encontrado"
 # ~/Applications, e por ultimo as do brew — que o Launch Services nao indexa e
 # portanto nunca conseguem pedir permissao.
 NOTIFIER_NAME="${GH_INBOX_NOTIFIER:-gh-inbox}"
+
+# Ordem: o notificador proprio (notifier/build.sh) primeiro; o
+# terminal-notifier fica como fallback para quem instalou antes da troca ou
+# nao tem swiftc. As flags que usamos sao as mesmas nos dois.
 find_tn() {
   local p
-  for p in "$HOME/Applications/$NOTIFIER_NAME.app" \
-           "$HOME/Applications/terminal-notifier.app" \
-           "/Applications/terminal-notifier.app" \
-           /opt/homebrew/opt/terminal-notifier/terminal-notifier.app \
-           /usr/local/opt/terminal-notifier/terminal-notifier.app; do
-    p="$p/Contents/MacOS/terminal-notifier"
+  for p in "$HOME/Applications/$NOTIFIER_NAME.app/Contents/MacOS/notifier" \
+           "$HOME/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier" \
+           "/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier" \
+           /opt/homebrew/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier \
+           /usr/local/opt/terminal-notifier/terminal-notifier.app/Contents/MacOS/terminal-notifier; do
     [ -x "$p" ] && { printf '%s' "$p"; return 0; }
   done
   return 1

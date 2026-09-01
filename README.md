@@ -187,27 +187,32 @@ chamada REST por evento `author`.
 O bucket `PRONTO` cobre o outro lado: aprovado e verde não aparecia em lugar nenhum, e
 é justamente o momento de agir.
 
-## Procedência da dependência
+## Sem dependência externa
 
-A única dependência é o `terminal-notifier`, e não é binário solto da internet: é a
-formula do homebrew-core, compilada pelo CI do Homebrew a partir do tarball da tag.
+O banner vem de um notificador próprio: **~120 linhas de Swift** sobre o
+`UserNotifications` da Apple, em `notifier/notifier.swift`. Nada de terceiro.
 
-| | |
-|---|---|
-| Licença | MIT, zero dependências |
-| Assinatura | **ad-hoc** (`TeamIdentifier` vazio) — não é notarizado |
-| Projeto | 7,3k stars, criado em 2012, mantido (push recente) |
-| Security advisories | nenhum publicado (verificado em 2026-08-25) |
-| Uso | ~90k instalações/ano |
-| Privilégio que pede | só permissão de notificação — sem disco, rede ou root |
+O `notifier/build.sh` compila com o `swiftc` do Command Line Tools e monta o app
+bundle com `sips`, `iconutil`, `PlistBuddy` e `codesign` — tudo nativo do macOS. O
+binário sai **universal (arm64 + x86_64)**, então o mesmo build serve Apple Silicon e
+Intel.
 
-A flag `-execute` (roda shell no clique) é deliberadamente **não usada**: só `-open`,
-que apenas abre uma URL.
+```bash
+./notifier/build.sh                     # ícone de assets/icon.svg, nome gh-inbox
+./notifier/build.sh caminho/logo.png    # PNG, SVG ou .icns
+./notifier/build.sh logo.png OutroNome  # muda também o nome exibido
+```
 
-Sobre "nativo": **não existe** opção 100% Apple para banner clicável. O `osascript`
-funciona sem permissão justamente porque não pede uma própria — e por isso a Apple não
-lhe dá handler de clique. As alternativas sem dependência são banner sem clique ou
-diálogo modal, que rouba o foco.
+Flags que ele aceita: `-title`, `-subtitle`, `-message`, `-open URL`, `-group ID`,
+`-list [ID|ALL]`, `-remove ID|ALL`. Sem argumentos ele roda como *handler* — é assim
+que o macOS o reabre quando alguém clica na notificação, e é onde a URL é aberta.
+
+O `terminal-notifier` continua sendo aceito como **fallback**: se ele existir e o
+notificador próprio não, o poller usa ele. As flags que usamos são iguais nos dois.
+
+Sobre "nativo": **não existe** opção que dispense a permissão. O `osascript` funciona
+sem pedir uma própria — e por isso a Apple não lhe dá handler de clique. Qualquer app
+que poste notificação precisa de consentimento do usuário, o nosso incluído.
 
 ## Problemas conhecidos
 
