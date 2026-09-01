@@ -263,13 +263,41 @@ ainda_meu() {  # repo, num -> 0 se ainda faz sentido revisar, 1 se obsoleto
   ' >/dev/null 2>&1
 }
 
+# Memoria de descarte, por PR e com validade. A chave de dedupe e
+# id@updated_at de proposito — thread que se move conta como evento novo — mas
+# para um PR JA determinado como "nao e mais seu" isso significa revalidar a
+# cada atividade dele, para sempre. Um PR ativo consumia uma chamada REST e uma
+# linha de log por atualizacao (medido: 10 checagens no mesmo PR em 2 dias).
+# TTL porque alguem pode voltar a pedir seu review depois; e o scan de estado,
+# que roda a cada 10 ticks, e quem detectaria isso de qualquer forma.
+DISCARD="$DIR/discarded.json"
+DISCARD_TTL=21600   # 6h
+[ -f "$DISCARD" ] || echo '{}' > "$DISCARD"
+
+descartado_recente() {  # repo#num -> 0 se foi descartado dentro do TTL
+  local t
+  t=$("$JQ" -r --arg k "$1" '.[$k] // 0' "$DISCARD" 2>/dev/null || echo 0)
+  [ "$t" = "0" ] && return 1
+  [ $(( $(date +%s) - t )) -lt "$DISCARD_TTL" ]
+}
+marca_descartado() {  # repo#num
+  local tmp; tmp=$(mktemp)
+  "$JQ" --arg k "$1" --argjson now "$(date +%s)" --argjson ttl "$DISCARD_TTL" \
+    'with_entries(select(.value > ($now - $ttl))) | .[$k] = $now' \
+    "$DISCARD" > "$tmp" 2>/dev/null && mv "$tmp" "$DISCARD" || rm -f "$tmp"
+}
+
 filtrados=$(printf '%s' "$novos" | "$JQ" -c '.[]' | while read -r ev; do
   reason=$(printf '%s' "$ev" | "$JQ" -r .reason)
   if [ "$reason" = "review_requested" ]; then
     repo=$(printf '%s' "$ev" | "$JQ" -r .repo)
     num=$(printf '%s' "$ev" | "$JQ" -r .num)
+    if descartado_recente "$repo#$num"; then
+      continue                      # ja se sabe que nao e seu: nem chama a API
+    fi
     if ! ainda_meu "$repo" "$num"; then
       log "descartado (pedido nao vale mais): $repo#$num"
+      marca_descartado "$repo#$num"
       continue
     fi
   fi
