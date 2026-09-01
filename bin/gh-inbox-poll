@@ -58,7 +58,27 @@ rotate_log() {
   fi
 }
 rotate_log
-die() { log "ERRO: $*"; exit 1; }
+# Falha silenciosa e o pior modo de falha aqui: se o token do gh expirar, os
+# banners simplesmente param e ninguem percebe por dias. Depois de 3 ciclos
+# consecutivos falhando, avisa na tela — via osascript, que nao depende de
+# permissao e portanto e o caminho que sobra quando algo esta quebrado.
+FAILS="$DIR/consecutive-fails"
+ok_cycle() { rm -f "$FAILS" 2>/dev/null || true; }
+die() {
+  log "ERRO: $*"
+  local n
+  n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$FAILS" 2>/dev/null || true
+  if [ "$n" = "3" ]; then
+    /usr/bin/osascript - "gh-inbox parou de funcionar" "$*" <<'AS' >/dev/null 2>&1
+on run argv
+  display notification (item 2 of argv) with title (item 1 of argv) subtitle "3 ciclos falharam seguidos"
+end run
+AS
+    log "avisou na tela: 3 falhas consecutivas"
+  fi
+  exit 1
+}
 
 # Lock: o launchd dispara a cada 60s, mas um ciclo com muitos eventos a validar
 # ja foi medido em 52s. Sem lock, dois ciclos se sobrepoem e fazem
@@ -204,7 +224,7 @@ HDR=$(mktemp); BODY=$(mktemp)
 } | "$CURL" -sS -D "$HDR" -o "$BODY" --config - 2>>"$LOG"
 
 status=$(awk 'toupper($1) ~ /^HTTP/ {print $2}' "$HDR" | tail -1)
-[ "$status" = "304" ] && exit 0          # nada novo: caminho comum, custo zero
+[ "$status" = "304" ] && { ok_cycle; exit 0; }   # nada novo: caminho comum, custo zero
 [ "$status" = "200" ] || { log "HTTP $status inesperado"; exit 1; }
 
 newlm=$(grep -i '^last-modified:' "$HDR" | tail -1 | cut -d' ' -f2- | tr -d '\r')
@@ -337,4 +357,5 @@ tmp=$(mktemp)
 ' > "$tmp" && mv "$tmp" "$NSEEN"
 
 "$BIN" scan >/dev/null 2>&1 && log "queue atualizada"
+ok_cycle
 exit 0
