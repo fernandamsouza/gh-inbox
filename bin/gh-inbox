@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# gh-inbox — triagem de PRs do GitHub sem gastar token.
+#
+# Classifica o que precisa da sua atencao em 4 buckets, mantendo estado para
+# que so o que e NOVO apareca no digest. Custo: 3 queries GraphQL por scan.
+#
+#   scan    coleta e classifica -> queue.json
+#   list    mostra a fila inteira (legivel)
+#   digest  imprime SO os itens novos (exit 1 se nao tem nada novo)
+#   mark    marca os itens atuais como vistos
+#   seed    scan + mark (usar 1x na instalacao: ignora o backlog)
+#   diff    <repo> <num>  delta desde o seu ultimo review (para re-review)
+#
+# bash, nao zsh: zsh nao faz word splitting de variavel sem quote.
+set -euo pipefail
+
+# O estado guarda titulos de PR de trabalho interno e o login do GitHub. Em
+# maquina com mais de um usuario, 022 deixaria tudo legivel por qualquer um.
+umask 077
+
+# Ordem: variavel de ambiente (o plist do LaunchAgent passa assim), senao o
+# arquivo gravado na instalacao. Sem o arquivo, `gh-inbox list` na mao exigiria
+# exportar a variavel toda vez.
+ORG="${GH_INBOX_ORG:-}"
+if [ -z "$ORG" ]; then
+  ORG_FILE="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}/org"
+  [ -s "$ORG_FILE" ] && ORG=$(cat "$ORG_FILE")
+fi
+[ -n "$ORG" ] || { printf 'gh-inbox: nao sei qual org triar. Rode o install.sh ou defina GH_INBOX_ORG.\n' >&2; exit 2; }
+DIR="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}"
+QUEUE="$DIR/queue.json"
+SEEN="$DIR/seen.json"
+
+mkdir -p "$DIR"
+[ -f "$SEEN" ] || echo '{}' > "$SEEN"
+
+die() { printf 'gh-inbox: %s\n' "$*" >&2; exit 2; }
+command -v gh >/dev/null || die "gh nao encontrado (brew install gh)"
+command -v jq >/dev/null || die "jq nao encontrado (brew install jq)"
+
+# Login do GitHub: descoberto do proprio gh e cacheado, para nao gastar uma
+# chamada de API por run. GH_INBOX_USER sobrescreve.
+LOGIN_CACHE="$DIR/login"
+gh_login() {
+  if [ -n "${GH_INBOX_USER:-}" ]; then printf '%s' "$GH_INBOX_USER"; return; fi
+  if [ -s "$LOGIN_CACHE" ]; then cat "$LOGIN_CACHE"; return; fi
+  local l
+  l=$(gh api user -q .login 2>/dev/null) || die "gh nao esta autenticado (gh auth login)"
+  [ -n "$l" ] || die "nao consegui descobrir seu login do GitHub"
+  printf '%s' "$l" > "$LOGIN_CACHE"
+  printf '%s' "$l"
+}
+ME=$(gh_login)
+
+# ---------------------------------------------------------------- scan
+
+QUERY_A='query($q: String!, $me: String!) {
+  search(query: $q, type: ISSUE, first: 100) {
+    nodes { ... on PullRequest {
+      number title url additions deletions isDraft headRefOid updatedAt
+      author { login }
+      repository { nameWithOwner }
+      reviews(author: $me, last: 1) { nodes { state submittedAt commit { oid } } }
+    } }
+  }
+}'
+
+QUERY_B='query($q: String!) {
+  search(query: $q, type: ISSUE, first: 100) {
+    nodes { ... on PullRequest {
+      number title url isDraft reviewDecision headRefOid updatedAt
+      repository { nameWithOwner }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      reviewThreads(first: 100) {
+        nodes { isResolved isOutdated comments(last: 1) { nodes { author { login } } } }
+      }
+    } }
+  }
+}'
+
+JQ_A='
+[ .data.search.nodes[]
+  | select(.number != null and (.isDraft | not))
+  | . as $p
+  | (if ($p.reviews.nodes | length) == 0 then null else $p.reviews.nodes[0] end) as $rev
+  | (if $rev == null then "PRIMEIRA"
+     elif $rev.commit.oid == $p.headRefOid then "JA_VISTO"
+     else "RE_REVIEW" end) as $b
+  | select($b != "JA_VISTO")
+  | { bucket: $b,
+      repo: $p.repository.nameWithOwner,
+      num: $p.number,
+      title: $p.title,
+      url: $p.url,
+      author: ($p.author.login // "?"),
+      adds: $p.additions,
+      dels: $p.deletions,
+      head_sha: $p.headRefOid,
+      base_sha: (if $rev == null then null else $rev.commit.oid end),
+      prev_state: (if $rev == null then null else $rev.state end),
+      prev_at: (if $rev == null then null else $rev.submittedAt end),
+      updated: $p.updatedAt,
+      rerequested: $rereq,
+      trivial: ((($p.author.login // "") | test("dependabot|renovate|\\[bot\\]$"; "i"))
+                or ((($p.title // "") | test("^(chore|bump|build\\(deps)"; "i"))
+                    and (($p.additions + $p.deletions) < 50)))
+    }
+  | .key = (if .bucket == "PRIMEIRA"
+            then "primeira:\(.repo)#\(.num)"
+            else "rereview:\(.repo)#\(.num)@\(.head_sha[0:12])" end)
+]'
+
+JQ_B='
+[ .data.search.nodes[]
+  | select(.number != null and (.isDraft | not))
+  | . as $p
+  | [ $p.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false) ] as $open
+  | ($open | length) as $nopen
+  | ([ $open[] | select(((.comments.nodes[0].author.login) // "") != $me) ] | length) as $waiting
+  | (($p.commits.nodes[0].commit.statusCheckRollup.state) // "NONE") as $ci
+  | ($p.reviewDecision // "SEM_REVIEW") as $dec
+  | (if $ci == "FAILURE" then "CI_VERMELHO"
+     elif ($dec == "CHANGES_REQUESTED") or ($waiting > 0) then "MEU_PR"
+     elif ($dec == "APPROVED") and ($ci == "SUCCESS" or $ci == "NONE") and $nopen == 0
+       then "PRONTO"
+     else "OK" end) as $b
+  | select($b != "OK")
+  | { bucket: $b,
+      repo: $p.repository.nameWithOwner,
+      num: $p.number,
+      title: $p.title,
+      url: $p.url,
+      author: $me,
+      decision: $dec,
+      ci: $ci,
+      threads_abertos: $nopen,
+      aguardando_voce: $waiting,
+      head_sha: $p.headRefOid,
+      updated: $p.updatedAt,
+      trivial: false
+    }
+  | .key = (if .bucket == "PRONTO"
+            then "pronto:\(.repo)#\(.num)@\(.head_sha[0:12])"
+            else "meupr:\(.repo)#\(.num)@\(.decision)+t\(.threads_abertos)+\(.ci)" end)
+]'
+
+cmd_scan() {
+  local a b c
+  # A: review pedido a voce (pedido formal, inclui re-pedido)
+  a=$(gh api graphql -f query="$QUERY_A" \
+        -f q="is:pr is:open review-requested:@me org:$ORG" -f me="$ME") \
+    || die "query A falhou"
+  # B: seus PRs (changes-requested, threads abertos, CI)
+  b=$(gh api graphql -f query="$QUERY_B" \
+        -f q="is:pr is:open author:@me org:$ORG") \
+    || die "query B falhou"
+  # C: voce ja revisou e vieram commits novos, MESMO sem re-pedido formal.
+  # Sem isso o re-review quase nunca dispara: o autor empurra o fix e nao
+  # re-pede, e o PR fica esperando voce sem sinal nenhum.
+  c=$(gh api graphql -f query="$QUERY_A" \
+        -f q="is:pr is:open reviewed-by:@me org:$ORG" -f me="$ME") \
+    || die "query C falhou"
+
+  local items_a items_b items_c
+  items_a=$(printf '%s' "$a" | jq -c --argjson rereq true "$JQ_A")
+  items_b=$(printf '%s' "$b" | jq -c --arg me "$ME" "$JQ_B")
+  items_c=$(printf '%s' "$c" | jq -c --argjson rereq false "$JQ_A")
+
+  # A tem precedencia sobre C: se o review foi pedido formalmente, e esse o item
+  jq -n --argjson a "$items_a" --argjson b "$items_b" --argjson c "$items_c" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    ([$a[] | "\(.repo)#\(.num)"] | map({key:., value:true}) | from_entries) as $ja
+    | ([$c[] | select(.bucket == "RE_REVIEW" and ($ja["\(.repo)#\(.num)"] | not))]) as $extra
+    | {scanned_at: $at, items: ($b + $a + $extra)}' > "$QUEUE.tmp" \
+    && mv "$QUEUE.tmp" "$QUEUE"
+  # Escrita atomica: o plugin da barra e o /inbox leem esse arquivo a qualquer
+  # momento. Redirecionar direto exporia um JSON pela metade.
+
+  jq -r '"scan ok: \(.items|length) itens ("
+         + ([.items[]|.bucket] | group_by(.) | map("\(.[0])=\(length)") | join(" ")) + ")"' "$QUEUE"
+}
+
+# ---------------------------------------------------------------- helpers
+
+need_queue() { [ -f "$QUEUE" ] || die "sem queue.json — rode 'gh-inbox scan' primeiro"; }
+
+# ordem de prioridade: o que trava merge primeiro, trivial por ultimo
+ORDER='{"PRONTO":0,"MEU_PR":1,"CI_VERMELHO":2,"RE_REVIEW":3,"PRIMEIRA":4}'
+
+JQ_FMT='
+def rank: '"$ORDER"'[.bucket] // 9;
+def nome:
+  if .bucket == "PRONTO" then "PRONTO"
+  elif .bucket == "MEU_PR" then "MEU PR"
+  elif .bucket == "CI_VERMELHO" then "CI VERMELHO"
+  elif .bucket == "RE_REVIEW" then "RE-REVIEW"
+  else "1a PASSADA" end;
+def detail:
+  if .bucket == "PRONTO" then
+    "aprovado, CI \(if .ci == "SUCCESS" then "verde" else "sem checks" end) — pronto pra mergear"
+  elif .bucket == "MEU_PR" then
+    "\(.decision)\(if .aguardando_voce > 0 then ", \(.aguardando_voce) thread(s) esperando voce" else "" end)"
+  elif .bucket == "CI_VERMELHO" then
+    "checks falhando\(if .decision != "SEM_REVIEW" then ", \(.decision)" else "" end)"
+  elif .bucket == "RE_REVIEW" then
+    "voce deu \(.prev_state); commits novos depois disso"
+    + (if .rerequested then " (re-pediram seu review)" else " (sem pedido formal)" end)
+  else
+    "+\(.adds)/-\(.dels) por \(.author)\(if .trivial then " [trivial]" else "" end)"
+  end;
+'
+
+# ---------------------------------------------------------------- list
+
+cmd_list() {
+  need_queue
+  jq -r "$JQ_FMT"'
+    (.items | sort_by(rank, (.trivial | if . then 1 else 0 end), .repo, .num))
+    | if length == 0 then "fila vazia" else
+      (.[] | "\(nome|.[0:11] + (" " * (11 - ([length,11]|min))))  \(.repo)#\(.num)  \(detail)\n              \(.title[0:78])")
+      end' "$QUEUE"
+}
+
+# ---------------------------------------------------------------- digest
+
+cmd_digest() {
+  need_queue
+  local out
+  out=$(jq -r --slurpfile seen "$SEEN" "$JQ_FMT"'
+    ($seen[0] // {}) as $s
+    | [ .items[] | select($s[.key] == null) ]
+    | sort_by(rank, (.trivial | if . then 1 else 0 end), .repo, .num)
+    | if length == 0 then empty else
+        (group_by(.bucket) | sort_by(.[0] | rank)
+         | map("*\(.[0]|nome)*\n" + (map("• <\(.url)|\(.repo)#\(.num)> — \(detail)\n  \(.title[0:90])") | join("\n")))
+         | join("\n\n"))
+      end' "$QUEUE")
+
+  if [ -z "$out" ]; then
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------- mark / seed
+
+cmd_mark() {
+  need_queue
+  local tmp
+  tmp=$(mktemp)
+  # regrava do zero com as chaves da fila atual: poda o que saiu e evita
+  # crescimento sem limite. Chave que reaparece com estado novo tem chave nova.
+  jq -n --slurpfile q "$QUEUE" --slurpfile seen "$SEEN" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    ($seen[0] // {}) as $old
+    | reduce ($q[0].items[]) as $i ({}; .[$i.key] = ($old[$i.key] // $at))
+  ' > "$tmp"
+  mv "$tmp" "$SEEN"
+  jq -r '"marcados: \(length) chaves vistas"' "$SEEN"
+}
+
+cmd_seed() {
+  cmd_scan
+  cmd_mark
+  echo "baseline semeado — daqui pra frente o digest so mostra o que for novo"
+}
+
+# ---------------------------------------------------------------- diff
+
+cmd_diff() {
+  local repo="${1:-}" num="${2:-}"
+  [ -n "$repo" ] && [ -n "$num" ] || die "uso: gh-inbox diff <owner/repo> <num>"
+  local base=""
+  if [ -f "$QUEUE" ]; then
+    base=$(jq -r --arg r "$repo" --argjson n "$num" \
+      '[.items[] | select(.repo == $r and .num == $n) | .base_sha // empty][0] // ""' "$QUEUE")
+  fi
+  local head
+  head=$(gh api "repos/$repo/pulls/$num" -q .head.sha)
+
+  if [ -z "$base" ] || [ "$base" = "null" ]; then
+    echo "# sem review anterior seu neste PR — diff completo"
+    gh pr diff "$num" --repo "$repo"
+    return
+  fi
+
+  echo "# delta desde o seu ultimo review ($base -> $head)"
+  gh api "repos/$repo/compare/$base...$head" \
+    -q '"commits novos: \(.commits|length)\narquivos: \(.files|length)\n",
+        (.files[] | "\n--- \(.filename) (+\(.additions)/-\(.deletions))\n\(.patch // "(sem patch: binario ou muito grande)")")'
+}
+
+# ---------------------------------------------------------------- main
+
+case "${1:-help}" in
+  scan)   cmd_scan ;;
+  list)   cmd_list ;;
+  digest) cmd_digest ;;
+  mark)   cmd_mark ;;
+  seed)   cmd_seed ;;
+  diff)   shift; cmd_diff "$@" ;;
+  *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# gh-inbox-poll — poll de 60s no /notifications do GitHub, custo zero.
+#
+# Requisicao condicional com If-Modified-Since: quando nada mudou o GitHub
+# responde 304, que NAO consome rate limit. Pollar de minuto em minuto sai de
+# graca, e nenhum token de LLM e gasto — isto e shell puro.
+#
+# Em evento novo: dispara notificacao do macOS e atualiza a queue.json, para o
+# /inbox achar a fila fresca. O banner e CLICAVEL quando o terminal-notifier
+# esta instalado e com permissao concedida; sem isso cai no osascript, que
+# sempre funciona mas nao clica.
+#
+# Instalado como LaunchAgent com StartInterval 60 — veja install.sh.
+# Sem `-e` de proposito: um ciclo que falha nao deve derrubar o poller inteiro,
+# ja que ele roda de minuto em minuto. O preco e que erro passa calado — foi
+# assim que um "unbound variable" ficou escondido — entao todo caminho de falha
+# que importa loga explicitamente.
+set -uo pipefail
+
+# Estado contem titulos de PR internos e o login do GitHub.
+umask 077
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+BIN="$SELF_DIR/gh-inbox"
+
+# Ordem: variavel de ambiente (o plist do LaunchAgent passa assim), senao o
+# arquivo gravado na instalacao. Sem o arquivo, `gh-inbox list` na mao exigiria
+# exportar a variavel toda vez.
+ORG="${GH_INBOX_ORG:-}"
+if [ -z "$ORG" ]; then
+  ORG_FILE="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}/org"
+  [ -s "$ORG_FILE" ] && ORG=$(cat "$ORG_FILE")
+fi
+[ -n "$ORG" ] || { printf 'gh-inbox: nao sei qual org triar. Rode o install.sh ou defina GH_INBOX_ORG.\n' >&2; exit 2; }
+DIR="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}"
+LM_FILE="$DIR/poll-last-modified"
+NSEEN="$DIR/notif-seen.json"
+TICK="$DIR/poll-tick"
+LOG="${GH_INBOX_LOG:-$HOME/Library/Logs/gh-inbox-poll.log}"
+
+# scan completo de estado a cada N ticks: CI vermelho nao gera notificacao no
+# GitHub, so aparece na consulta por estado.
+SCAN_EVERY="${GH_INBOX_SCAN_EVERY:-10}"
+
+mkdir -p "$DIR" "$(dirname "$LOG")"
+[ -f "$NSEEN" ] || echo '{}' > "$NSEEN"
+[ -f "$TICK" ] || echo 0 > "$TICK"
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+# Rodando 24/7, o log cresce ~150 linhas/dia so de scan periodico. Sem isto
+# viraria dezenas de milhares de linhas em um ano.
+rotate_log() {
+  local n
+  n=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+  if [ "$n" -gt 2000 ]; then
+    tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+  fi
+}
+rotate_log
+die() { log "ERRO: $*"; exit 1; }
+
+# Lock: o launchd dispara a cada 60s, mas um ciclo com muitos eventos a validar
+# ja foi medido em 52s. Sem lock, dois ciclos se sobrepoem e fazem
+# read-modify-write concorrente no notif-seen.json — updates perdidos e banner
+# duplicado. mkdir e atomico em qualquer FS; nao existe flock no macOS base.
+LOCK="$DIR/.lock"
+HDR=""; BODY=""
+cleanup() {
+  [ -n "$HDR" ] && rm -f "$HDR"
+  [ -n "$BODY" ] && rm -f "$BODY"
+  rmdir "$LOCK" 2>/dev/null || true
+}
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    log "lock com mais de 10min, assumindo ciclo morto e reassumindo"
+    rmdir "$LOCK" 2>/dev/null || true
+    mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0   # outro ciclo em andamento: sai calado
+  fi
+fi
+trap cleanup EXIT
+
+# Binarios resolvidos em runtime: o brew fica em /opt/homebrew (Apple silicon)
+# ou /usr/local (Intel), e o launchd nao herda o PATH do shell.
+find_bin() {
+  local n="$1" p
+  p=$(command -v "$n" 2>/dev/null) && [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+  for p in /opt/homebrew/bin/"$n" /usr/local/bin/"$n" /usr/bin/"$n"; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+GH=$(find_bin gh)   || die "gh nao encontrado"
+JQ=$(find_bin jq)   || die "jq nao encontrado"
+CURL=$(find_bin curl) || die "curl nao encontrado"
+OSA=$(find_bin osascript) || die "osascript nao encontrado"
+
+# terminal-notifier: chamar o executavel de DENTRO do .app. O
+# $(brew --prefix)/bin/terminal-notifier e um shim em shell que mascara o erro
+# real de permissao, o que torna o diagnostico impossivel.
+# Ordem importa: o macOS so deixa um app PEDIR autorizacao de notificacao se o
+# Launch Services o conhece, e ele nao indexa o Cellar do brew. Por isso o
+# install.sh copia o .app para ~/Applications e registra; as copias do brew
+# ficam como ultimo recurso (funcionam via fallback do osascript, nao clicam).
+# Preferencia: a copia com nome e icone proprios (make-icon.sh) vem primeiro,
+# para o banner aparecer como "gh-inbox". Depois a copia registrada em
+# ~/Applications, e por ultimo as do brew — que o Launch Services nao indexa e
+# portanto nunca conseguem pedir permissao.
+NOTIFIER_NAME="${GH_INBOX_NOTIFIER:-gh-inbox}"
+find_tn() {
+  local p
+  for p in "$HOME/Applications/$NOTIFIER_NAME.app" \
+           "$HOME/Applications/terminal-notifier.app" \
+           "/Applications/terminal-notifier.app" \
+           /opt/homebrew/opt/terminal-notifier/terminal-notifier.app \
+           /usr/local/opt/terminal-notifier/terminal-notifier.app; do
+    p="$p/Contents/MacOS/terminal-notifier"
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+TN=$(find_tn || true)
+
+# ATENCAO ao -group: "old notifications with the same ID will be removed".
+# Um grupo fixo apagaria o banner anterior a cada evento novo, destruindo o
+# historico na Central de Notificacoes. Grupo UNICO POR PR: o historico
+# acumula, e um evento repetido no mesmo PR substitui so a propria entrada.
+# A primeira chamada de um bundle id novo BLOQUEIA esperando o prompt de
+# permissao do macOS (medido: 2min sem resposta). Sob launchd isso seguraria o
+# lock e travaria o ciclo, entao roda com teto de 5s e cai no osascript.
+notify() {  # titulo, subtitulo, corpo, url, group
+  if [ -n "$TN" ]; then
+    ( "$TN" -title "$1" -subtitle "$2" -message "$3" -open "$4" -group "$5" \
+        >/dev/null 2>&1 ) &
+    local pid=$! w=0
+    while kill -0 "$pid" 2>/dev/null && [ "$w" -lt 5 ]; do sleep 1; w=$((w+1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      log "notificador travado (prompt de permissao pendente?) — usando osascript"
+    elif wait "$pid"; then
+      return 0
+    fi
+  fi
+  "$OSA" - "$1" "$2" "$3" <<'AS' >/dev/null 2>&1
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+AS
+}
+
+TOKEN=$("$GH" auth token 2>/dev/null) || die "gh nao esta autenticado"
+[ -n "$TOKEN" ] || die "token vazio"
+
+# Login do GitHub, cacheado em disco (o gh-inbox usa o mesmo arquivo). Sem isto
+# o filtro de estado abaixo quebra com "ME: unbound variable" sob `set -u` e
+# passa a descartar TODOS os eventos — falha silenciosa e total.
+LOGIN_CACHE="$DIR/login"
+ME="${GH_INBOX_USER:-}"
+if [ -z "$ME" ]; then
+  if [ -s "$LOGIN_CACHE" ]; then
+    ME=$(cat "$LOGIN_CACHE")
+  else
+    ME=$("$GH" api user -q .login 2>/dev/null || true)
+    [ -n "$ME" ] && printf '%s' "$ME" > "$LOGIN_CACHE"
+  fi
+fi
+[ -n "$ME" ] || die "nao consegui descobrir o login do GitHub"
+export ME
+
+tick=$(( $(cat "$TICK" 2>/dev/null || echo 0) + 1 ))
+echo "$tick" > "$TICK"
+
+if [ $(( tick % SCAN_EVERY )) -eq 0 ]; then
+  # Revalida o login antes do scan. `gh auth switch` deixaria o cache apontando
+  # para outra conta, e o efeito seria silencioso: reviews(author: $me) volta
+  # vazio, re-review vira PRIMEIRA na Query A e e DESCARTADO na Query C. Ou
+  # seja, re-review desaparece sem erro nenhum. 1 chamada REST a cada 10 min.
+  atual=$("$GH" api user -q .login 2>/dev/null || true)
+  if [ -n "$atual" ] && [ "$atual" != "$ME" ]; then
+    log "conta do gh mudou: $ME -> $atual (cache atualizado)"
+    printf '%s' "$atual" > "$LOGIN_CACHE"
+    ME="$atual"; export ME
+    rm -f "$NSEEN" "$LM_FILE"     # estado da conta antiga nao vale mais
+    echo '{}' > "$NSEEN"
+  fi
+  "$BIN" scan >/dev/null 2>&1 && log "scan periodico ok (tick $tick)"
+fi
+
+LM=$(cat "$LM_FILE" 2>/dev/null || true)
+HDR=$(mktemp); BODY=$(mktemp)
+
+# O token vai por --config no stdin, NAO em argv: header em linha de comando
+# fica visivel em `ps` para qualquer processo local.
+{
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"
+  printf 'header = "Accept: application/vnd.github+json"\n'
+  [ -n "$LM" ] && printf 'header = "If-Modified-Since: %s"\n' "$LM"
+  printf 'url = "https://api.github.com/notifications?per_page=50"\n'
+} | "$CURL" -sS -D "$HDR" -o "$BODY" --config - 2>>"$LOG"
+
+status=$(awk 'toupper($1) ~ /^HTTP/ {print $2}' "$HDR" | tail -1)
+[ "$status" = "304" ] && exit 0          # nada novo: caminho comum, custo zero
+[ "$status" = "200" ] || { log "HTTP $status inesperado"; exit 1; }
+
+newlm=$(grep -i '^last-modified:' "$HDR" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+[ -n "$newlm" ] && printf '%s' "$newlm" > "$LM_FILE"
+
+novos=$("$JQ" -c --slurpfile seen "$NSEEN" --arg org "$ORG" '
+  ($seen[0] // {}) as $s
+  | [ .[]
+      | select(.subject.type == "PullRequest")
+      | select(.repository.full_name | startswith($org + "/"))
+      | select(.reason | IN("review_requested","mention","team_mention","comment","author","assign"))
+      | { key: "\(.id)@\(.updated_at)",
+          reason: .reason,
+          repo: .repository.full_name,
+          num: ((.subject.url // "") | capture("/pulls/(?<n>[0-9]+)$").n // "?"),
+          title: .subject.title }
+      | select($s[.key] == null) ]' "$BODY" 2>>"$LOG")
+
+n=$(printf '%s' "$novos" | "$JQ" 'length' 2>/dev/null || echo 0)
+[ "$n" -eq 0 ] && exit 0
+
+# Notificacao e EVENTO; a fila e ESTADO. Um review_requested pode chegar (ou
+# ficar) obsoleto: pedido a um time e reassignado, ou o pedido e removido antes
+# de voce clicar. Sem esta checagem o banner te manda para um PR que nao e mais
+# seu. Em uso real, a maior parte dos eventos de review que chegam ja nao
+# corresponde a nada pendente.
+# Custo: 1 chamada REST por evento novo de review_requested (~15-20/dia).
+ainda_meu() {  # repo, num -> 0 se ainda faz sentido revisar, 1 se obsoleto
+  local pr
+  pr=$("$GH" api "repos/$1/pulls/$2" 2>/dev/null) || return 0   # na duvida, notifica
+  printf '%s' "$pr" | "$JQ" -e --arg me "$ME" '
+       .state == "open"
+   and (.draft | not)
+   and ( (([.requested_reviewers[]?.login] | index($me)) != null)
+         or ((.requested_teams // []) | length) > 0 )
+  ' >/dev/null 2>&1
+}
+
+filtrados=$(printf '%s' "$novos" | "$JQ" -c '.[]' | while read -r ev; do
+  reason=$(printf '%s' "$ev" | "$JQ" -r .reason)
+  if [ "$reason" = "review_requested" ]; then
+    repo=$(printf '%s' "$ev" | "$JQ" -r .repo)
+    num=$(printf '%s' "$ev" | "$JQ" -r .num)
+    if ! ainda_meu "$repo" "$num"; then
+      log "descartado (pedido nao vale mais): $repo#$num"
+      continue
+    fi
+  fi
+  printf '%s\n' "$ev"
+done | "$JQ" -s -c '.')
+
+# Guarda a lista COMPLETA: o seen.json no fim marca tudo que chegou, inclusive
+# o que foi descartado — senao o descartado volta a ser "novo" no proximo tick.
+novos_todos="$novos"
+novos="$filtrados"
+
+n=$(printf '%s' "$novos" | "$JQ" 'length' 2>/dev/null || echo 0)
+if [ "$n" -eq 0 ]; then
+  # nada a notificar, mas marca o que chegou para nao reprocessar
+  tmp=$(mktemp)
+  "$JQ" -n --slurpfile seen "$NSEEN" --argjson novos "$novos_todos" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    (($seen[0] // {}) + (reduce $novos[] as $i ({}; .[$i.key] = $at)))
+    | to_entries | sort_by(.value) | (if length > 500 then .[-500:] else . end) | from_entries
+  ' > "$tmp" && mv "$tmp" "$NSEEN"
+  "$BIN" scan >/dev/null 2>&1
+  exit 0
+fi
+
+# Um evento "author" quer dizer apenas "atividade no seu PR": approve,
+# changes-requested, comentario e push produzem o MESMO payload, porque o
+# subject.title da notificacao e o titulo do PR, nao o estado do review. Sem
+# olhar o review, o banner nao distingue elogio de pedido de mudanca.
+# Custo: 1 chamada REST por evento author (~2/dia nesta conta).
+estado_review() {  # repo, num -> rotulo
+  local st
+  st=$("$GH" api "repos/$1/pulls/$2/reviews" --jq \
+       '[.[] | select(.user.login != $ENV.ME)] | if length == 0 then "" else (last | .state) end' \
+       2>/dev/null) || st=""
+  case "$st" in
+    APPROVED)          echo "aprovado";;
+    CHANGES_REQUESTED) echo "mudancas pedidas";;
+    COMMENTED)         echo "comentario no review";;
+    DISMISSED)         echo "review dispensado";;
+    *)                 echo "no seu PR";;
+  esac
+}
+
+label() {  # reason, repo, num
+  case "$1" in
+    review_requested) echo "review pedido";;
+    mention|team_mention) echo "te marcaram";;
+    comment) echo "comentario";;
+    author) estado_review "$2" "$3";;
+    assign) echo "te atribuiram";;
+    *) echo "$1";;
+  esac
+}
+
+first=$(printf '%s' "$novos" | "$JQ" -r '.[0] | "\(.reason)\t\(.repo)#\(.num)\t\(.title)"')
+r=$(printf '%s' "$first" | cut -f1)
+where=$(printf '%s' "$first" | cut -f2)
+what=$(printf '%s' "$first" | cut -f3)
+
+if [ "${GH_INBOX_SEED:-0}" = "1" ]; then
+  log "seed: $n evento(s) marcados como vistos, sem notificar"
+elif [ "$n" -eq 1 ]; then
+  notify "gh-inbox" "$(label "$r" "${where%#*}" "${where#*#}") — $where" "${what:0:120}" \
+         "https://github.com/${where%#*}/pull/${where#*#}" \
+         "ghinbox-$(printf '%s' "$where" | tr -c 'A-Za-z0-9' '-')"
+  log "notificou: 1 evento novo — $where"
+else
+  # lote: um por PR, para cada um virar uma entrada propria no historico
+  printf '%s' "$novos" | "$JQ" -c '.[]' | while read -r ev; do
+    er=$(printf '%s' "$ev" | "$JQ" -r .reason)
+    ew=$(printf '%s' "$ev" | "$JQ" -r '"\(.repo)#\(.num)"')
+    et=$(printf '%s' "$ev" | "$JQ" -r .title)
+    notify "gh-inbox" "$(label "$er" "${ew%#*}" "${ew#*#}") — $ew" "${et:0:120}" \
+           "https://github.com/${ew%#*}/pull/${ew#*#}" \
+           "ghinbox-$(printf '%s' "$ew" | tr -c 'A-Za-z0-9' '-')"
+  done
+  log "notificou: $n eventos novos (um banner cada) — primeiro: $where"
+fi
+
+tmp=$(mktemp)
+"$JQ" -n --slurpfile seen "$NSEEN" --argjson novos "${novos_todos:-$novos}" \
+      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+  (($seen[0] // {}) + (reduce $novos[] as $i ({}; .[$i.key] = $at)))
+  | to_entries | sort_by(.value) | (if length > 500 then .[-500:] else . end) | from_entries
+' > "$tmp" && mv "$tmp" "$NSEEN"
+
+"$BIN" scan >/dev/null 2>&1 && log "queue atualizada"
+exit 0
