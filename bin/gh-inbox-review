@@ -13,8 +13,9 @@
 #      `event` da API nao e montado em nenhum lugar deste arquivo. O envio
 #      acontece so na interface web do GitHub, pela usuaria.
 #
-# GH_INBOX_REVIEW_DRYRUN=1 troca o claude por um eco: valida guarda de custo,
-# lock e notificacao sem gastar token.
+# GH_INBOX_REVIEW_DRYRUN=1 troca o claude por um eco e NAO cria review no
+# GitHub: valida guarda de custo, lock e notificacao sem gastar token nem
+# tocar no PR.
 set -uo pipefail
 umask 077
 
@@ -236,42 +237,54 @@ fi
 N_ACH=$("$JQ" '.achados | length' "$WORK/out.json")
 N_BLOQ=$("$JQ" '[.achados[] | select(.severidade=="bloqueante")] | length' "$WORK/out.json")
 
-"$JQ" '[.achados[] | select(.path != null and .line != null)
-       | {path, line, side: "RIGHT", body: ("**\(.severidade)** \(.corpo)")}]' \
-  "$WORK/out.json" > "$WORK/comments.json"
+if [ "${GH_INBOX_REVIEW_DRYRUN:-0}" = "1" ]; then
+  # DRYRUN existe pra validar custo/lock/notificacao sem gastar token — criar
+  # um review de verdade no PR alheio enquanto isso seria o oposto de "dry".
+  log "DRYRUN: nao criei review no GitHub"
+else
+  "$JQ" '[.achados[] | select(.path != null and .line != null)
+         | {path, line, side: "RIGHT", body: ("**\(.severidade)** \(.corpo)")}]' \
+    "$WORK/out.json" > "$WORK/comments.json"
 
-BODY=$("$JQ" -r '.resumo' "$WORK/out.json")
-SOLTOS=$("$JQ" -r '[.achados[] | select(.path == null or .line == null) | "- \(.corpo)"] | join("\n")' "$WORK/out.json")
-[ -n "$SOLTOS" ] && BODY="$BODY
+  BODY=$("$JQ" -r '.resumo' "$WORK/out.json")
+  SOLTOS=$("$JQ" -r '[.achados[] | select(.path == null or .line == null) | "- \(.corpo)"] | join("\n")' "$WORK/out.json")
+  [ -n "$SOLTOS" ] && BODY="$BODY
 
 Achados fora do diff:
 $SOLTOS"
 
-# O payload e montado aqui, explicitamente, com jq: `-F campo=@arquivo` leria o
-# arquivo como STRING e o GitHub recusa ("[] is not an array", 422).
-# Note que o objeto nao tem a chave `event` — e o que mantem o review PENDENTE.
-if [ "$("$JQ" 'length' "$WORK/comments.json")" -gt 0 ]; then
-  "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
-        --slurpfile c "$WORK/comments.json" \
-        '{commit_id: $commit, body: $body, comments: $c[0]}' > "$WORK/payload.json"
-else
-  "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
-        '{commit_id: $commit, body: $body}' > "$WORK/payload.json"
+  # O payload e montado aqui, explicitamente, com jq: `-F campo=@arquivo` leria
+  # o arquivo como STRING e o GitHub recusa ("[] is not an array", 422).
+  # Note que o objeto nao tem a chave `event` — e o que mantem o review PENDENTE.
+  if [ "$("$JQ" 'length' "$WORK/comments.json")" -gt 0 ]; then
+    "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
+          --slurpfile c "$WORK/comments.json" \
+          '{commit_id: $commit, body: $body, comments: $c[0]}' > "$WORK/payload.json"
+  else
+    "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
+          '{commit_id: $commit, body: $body}' > "$WORK/payload.json"
+  fi
+
+  "$GH" api "repos/$REPO/pulls/$NUM/reviews" -X POST --input "$WORK/payload.json" \
+    > "$WORK/created.json" 2>>"$HOME/Library/Logs/gh-inbox-action.log" \
+    || fail "nao consegui criar o review pendente"
+
+  STATE=$("$JQ" -r '.state // "?"' "$WORK/created.json")
+  [ "$STATE" = "PENDING" ] || log "ATENCAO: review criado com state=$STATE (esperado PENDING)"
 fi
-
-"$GH" api "repos/$REPO/pulls/$NUM/reviews" -X POST --input "$WORK/payload.json" \
-  > "$WORK/created.json" 2>>"$HOME/Library/Logs/gh-inbox-action.log" \
-  || fail "nao consegui criar o review pendente"
-
-STATE=$("$JQ" -r '.state // "?"' "$WORK/created.json")
-[ "$STATE" = "PENDING" ] || log "ATENCAO: review criado com state=$STATE (esperado PENDING)"
 "$JQ" -n --argjson a "$N_ACH" --argjson b "$N_BLOQ" '{achados:$a, bloqueantes:$b}' > "$RESULT"
 
 # ---- notifica o resultado --------------------------------------------------
 [ -f "$RESULT" ] || fail "a skill nao escreveu o resultado"
 A=$("$JQ" -r '.achados // "?"' "$RESULT" 2>/dev/null)
 B=$("$JQ" -r '.bloqueantes // 0' "$RESULT" 2>/dev/null)
-log "review pronto: $REPO#$NUM — $A achado(s), $B bloqueante(s)"
-notify "review pronto — $REPO#$NUM" \
-  "$A achado(s), $B bloqueante(s) · pendente, clique para ler e submeter no GitHub" \
-  "https://github.com/$REPO/pull/$NUM/files"
+if [ "${GH_INBOX_REVIEW_DRYRUN:-0}" = "1" ]; then
+  log "DRYRUN pronto: $REPO#$NUM — $A achado(s), $B bloqueante(s) (nada criado no GitHub)"
+  notify "DRYRUN — $REPO#$NUM" "$A achado(s), $B bloqueante(s) · nada foi criado no GitHub" \
+    "https://github.com/$REPO/pull/$NUM"
+else
+  log "review pronto: $REPO#$NUM — $A achado(s), $B bloqueante(s)"
+  notify "review pronto — $REPO#$NUM" \
+    "$A achado(s), $B bloqueante(s) · pendente, clique para ler e submeter no GitHub" \
+    "https://github.com/$REPO/pull/$NUM/files"
+fi

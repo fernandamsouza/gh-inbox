@@ -116,7 +116,15 @@ PRONTO=
 default=review-profundo
 SKILLS
 fi
-chmod 600 "$STATE_DIR"/* 2>/dev/null || true
+# Diretorio precisa do bit de execucao pra ser atravessavel (mkdir/ls dentro
+# dele) — um chmod 600 raso no glob pegava `reviewing/` e `reviews/` junto com
+# os arquivos de estado e tirava esse bit, o que quebrava TODO mkdir de lock
+# do botao Revisar com "permission denied". O botao entao sempre reportava
+# "ja tem review em andamento" (o mkdir falhava, e o script nao distinguia
+# lock alheio de erro de permissao) — silencioso, nunca rodava nada. find
+# separa por tipo e corrige tambem quem ja tinha instalado com o bug.
+find "$STATE_DIR" -type d -exec chmod 700 {} + 2>/dev/null || true
+find "$STATE_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
 install -m 755 "$SRC/bin/gh-inbox" "$BIN_DIR/gh-inbox"
 install -m 755 "$SRC/bin/gh-inbox-poll" "$BIN_DIR/gh-inbox-poll"
 install -m 755 "$SRC/bin/gh-inbox-review" "$BIN_DIR/gh-inbox-review"
