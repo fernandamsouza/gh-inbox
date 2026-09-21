@@ -123,7 +123,7 @@ revalidada a cada 10 minutos (se você rodar `gh auth switch`, ele percebe e tro
 | `GH_INBOX_SEEN_CAP` | `5000` (teto de segurança, além do TTL) |
 | `GH_INBOX_REVIEW_MAX` | `10` (teto diário de reviews pelo botão Revisar) |
 | `GH_INBOX_REVIEW_SKILL` | sobrescreve o `skills.conf` para todo bucket |
-| `GH_INBOX_REVIEW_DRYRUN` | `1` roda o botão Revisar sem chamar `claude` (testa custo/lock/notificação) |
+| `GH_INBOX_REVIEW_DRYRUN` | `1` roda o botão Revisar sem chamar `claude` nem criar review no GitHub |
 
 ## Ícone e nome do banner
 
@@ -294,7 +294,8 @@ diff.
 Guardas adicionais: teto de `GH_INBOX_REVIEW_MAX` (10/dia) reviews automáticos, lock por
 PR (não duplica se já tem um em andamento ou pendente seu), e log em
 `~/Library/Logs/gh-inbox-action.log`. `GH_INBOX_REVIEW_DRYRUN=1` testa o fluxo inteiro
-sem gastar token de LLM.
+sem gastar token de LLM **e sem criar nada no GitHub** — nem o `claude` roda, nem o
+review pendente é criado.
 
 ## Limitações conhecidas
 
