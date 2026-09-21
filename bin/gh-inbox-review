@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# gh-inbox-review — o que o botao "Revisar" do banner executa.
+#
+#   gh-inbox-review <owner/repo> <num>
+#
+# NAO e um `claude -p` cru: e o wrapper que da as garantias do desenho.
+#
+# DOIS INVARIANTES, e nenhum caminho deste script pode viola-los:
+#
+#   1. So roda por acao explicita da usuaria. Este script nunca e chamado pelo
+#      poller — apenas pelo clique no botao do banner, ou a mao.
+#   2. NUNCA submete review. Cria exclusivamente review PENDENTE, e o campo
+#      `event` da API nao e montado em nenhum lugar deste arquivo. O envio
+#      acontece so na interface web do GitHub, pela usuaria.
+#
+# GH_INBOX_REVIEW_DRYRUN=1 troca o claude por um eco: valida guarda de custo,
+# lock e notificacao sem gastar token.
+set -uo pipefail
+umask 077
+
+DIR="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}"
+LOG="${GH_INBOX_LOG:-$HOME/Library/Logs/gh-inbox-poll.log}"
+MAX="${GH_INBOX_REVIEW_MAX:-10}"
+CONF="$DIR/skills.conf"
+REVIEWING="$DIR/reviewing"
+OUT="$DIR/reviews"
+mkdir -p "$DIR" "$REVIEWING" "$OUT" "$(dirname "$LOG")"
+
+REPO="${1:-}"; NUM="${2:-}"
+log() { printf '%s [review] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+find_bin() {
+  local n="$1" p
+  p=$(command -v "$n" 2>/dev/null) && [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+  for p in /opt/homebrew/bin/"$n" /usr/local/bin/"$n" /usr/bin/"$n"; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+GH=$(find_bin gh) || { log "ERRO: gh nao encontrado"; exit 2; }
+JQ=$(find_bin jq) || { log "ERRO: jq nao encontrado"; exit 2; }
+OSA=$(find_bin osascript || echo /usr/bin/osascript)
+
+TN=""
+for p in "$HOME/Applications/${GH_INBOX_NOTIFIER:-gh-inbox}.app/Contents/MacOS/notifier" \
+         "$HOME/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier"; do
+  [ -x "$p" ] && { TN="$p"; break; }
+done
+
+notify() {  # subtitulo, corpo, url
+  if [ -n "$TN" ] && "$TN" -title "gh-inbox" -subtitle "$1" -message "$2" \
+       -open "$3" -group "ghinbox-review-$(printf '%s' "$REPO#$NUM" | tr -c 'A-Za-z0-9' '-')" \
+       >/dev/null 2>&1; then return 0; fi
+  "$OSA" - "gh-inbox" "$1" "$2" <<'AS' >/dev/null 2>&1
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+AS
+}
+
+fail() { log "FALHOU $REPO#$NUM: $*"; notify "review falhou — $REPO#$NUM" "$* · log: $LOG" \
+           "https://github.com/$REPO/pull/$NUM"; exit 1; }
+
+[ -n "$REPO" ] && [ -n "$NUM" ] || { echo "uso: gh-inbox-review <owner/repo> <num>" >&2; exit 2; }
+
+# ---- guarda de custo -------------------------------------------------------
+# O clique autoriza UM item, nao uma rodada. Sem teto, um clique repetido ou um
+# loop viraria gasto sem supervisao.
+COUNT_FILE="$DIR/review-count-$(date +%Y-%m-%d)"
+N=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+if [ "$N" -ge "$MAX" ]; then
+  log "recusado: teto diario de $MAX reviews atingido"
+  notify "teto diario atingido ($MAX)" "nao rodei o review de $REPO#$NUM" \
+    "https://github.com/$REPO/pull/$NUM"
+  exit 3
+fi
+
+# ---- lock por PR -----------------------------------------------------------
+LOCK="$REVIEWING/$(printf '%s' "$REPO#$NUM" | tr -c 'A-Za-z0-9' '-')"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 0
+    log "lock antigo de $REPO#$NUM reassumido"
+  else
+    log "$REPO#$NUM ja tem review em andamento"
+    notify "review ja em andamento" "$REPO#$NUM" "https://github.com/$REPO/pull/$NUM"
+    exit 0
+  fi
+fi
+
+# ---- ja existe review pendente? --------------------------------------------
+# So pode haver um por pessoa por PR: criar outro falha na API.
+ME="${GH_INBOX_USER:-$(cat "$DIR/login" 2>/dev/null || "$GH" api user -q .login 2>/dev/null)}"
+PEND=$("$GH" api "repos/$REPO/pulls/$NUM/reviews" \
+        --jq "[.[] | select(.user.login==\"$ME\" and .state==\"PENDING\")] | length" 2>/dev/null || echo 0)
+if [ "${PEND:-0}" != "0" ]; then
+  log "$REPO#$NUM ja tem review pendente seu"
+  notify "voce ja tem review pendente" "$REPO#$NUM — termine ou descarte no GitHub" \
+    "https://github.com/$REPO/pull/$NUM/files"
+  exit 0
+fi
+
+# ---- qual skill ------------------------------------------------------------
+# O bucket vem da fila. Se o PR nao estiver la, NAO se finge que e PRIMEIRA:
+# isso ignoraria um bucket deliberadamente vazio e revisaria algo que a fila nao
+# conhece. Cai em `default` e o log diz que caiu.
+BUCKET=$("$JQ" -r --arg r "$REPO" --argjson n "$NUM" \
+  '[.items[] | select(.repo==$r and .num==$n) | .bucket][0] // ""' \
+  "$DIR/queue.json" 2>/dev/null || echo "")
+if [ -z "$BUCKET" ]; then
+  log "$REPO#$NUM nao esta na fila; usando a skill default"
+  BUCKET="(fora da fila)"
+  KEY="default"
+else
+  KEY="$BUCKET"
+fi
+
+SKILL="${GH_INBOX_REVIEW_SKILL:-}"
+if [ -z "$SKILL" ] && [ -f "$CONF" ]; then
+  # Distingue "chave ausente" de "chave presente e vazia": a segunda e uma
+  # decisao de nao oferecer review naquele bucket, e tem que ser respeitada.
+  if grep -qE "^$KEY=" "$CONF" 2>/dev/null; then
+    SKILL=$(grep -E "^$KEY=" "$CONF" | head -1 | cut -d= -f2-)
+    if [ -z "$SKILL" ]; then
+      log "bucket $BUCKET tem skill vazia no conf: nao rodo review aqui"
+      notify "sem review para este bucket" "$REPO#$NUM ($BUCKET)" \
+        "https://github.com/$REPO/pull/$NUM"
+      exit 0
+    fi
+  else
+    SKILL=$(grep -E '^default=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+  fi
+fi
+[ -n "$SKILL" ] || fail "nenhuma skill configurada para o bucket $BUCKET"
+
+log "iniciando review de $REPO#$NUM (bucket $BUCKET, skill $SKILL)"
+echo $((N + 1)) > "$COUNT_FILE"
+
+# ---- roda a skill ----------------------------------------------------------
+RESULT="$OUT/$(printf '%s' "$REPO#$NUM" | tr -c 'A-Za-z0-9' '-').json"
+rm -f "$RESULT"
+
+# ---- contexto: o wrapper busca, o LLM so le ---------------------------------
+# O LLM NAO recebe `gh` nem Bash. Consequencias, as duas desejadas:
+#   - nao consegue escrever no GitHub, entao o invariante 2 deixa de depender de
+#     o prompt ser obedecido e passa a ser estrutural
+#   - nao roda teste nem linter, entao o review e baseado em diff. Isso e menos
+#     do que o review-profundo promete, e o corpo do review diz isso.
+WORK=$(mktemp -d) || fail "nao consegui criar diretorio de trabalho"
+trap 'rm -rf "$WORK"; rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+"$GH" pr view "$NUM" --repo "$REPO" \
+  --json title,body,author,additions,deletions,changedFiles,headRefOid,baseRefName \
+  > "$WORK/pr.json" 2>/dev/null || fail "nao consegui ler o PR"
+"$GH" pr diff "$NUM" --repo "$REPO" > "$WORK/diff.patch" 2>/dev/null \
+  || fail "nao consegui ler o diff"
+HEAD_SHA=$("$JQ" -r .headRefOid "$WORK/pr.json")
+[ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "null" ] || fail "nao consegui o head sha"
+
+log "contexto pronto ($(wc -l < "$WORK/diff.patch") linhas de diff)"
+
+# ---- roda a skill, sem Bash e sem rede -------------------------------------
+PROMPT=$(cat <<PROMPT_END
+Faca um code review do pull request $REPO#$NUM.
+
+Voce NAO tem Bash nem acesso a rede. Todo o contexto esta em arquivos:
+  $WORK/pr.json      metadados do PR
+  $WORK/diff.patch   o diff completo
+
+Aplique o metodo da skill $SKILL no que for possivel a partir do diff. Voce NAO
+consegue rodar teste nem linter, entao nao afirme que rodou, e diga no resumo
+que o review foi feito sobre o diff, sem ground truth executado.
+
+Responda APENAS com um JSON, sem cercas de codigo e sem texto antes ou depois:
+
+{"resumo": "<2-4 linhas, mencionando a limitacao acima>",
+ "achados": [
+   {"path": "<caminho no repo>", "line": <numero da linha no lado novo do diff>,
+    "severidade": "bloqueante"|"atencao",
+    "corpo": "<a afirmacao, o cenario de falha concreto, e a sugestao>"}
+ ]}
+
+Se um achado nao cair em linha presente no diff, omita "path" e "line" e
+escreva o arquivo:linha dentro de "corpo" — ele vai para o resumo do review.
+Se nao houver nada a apontar, devolva "achados": [].
+PROMPT_END
+)
+
+if [ "${GH_INBOX_REVIEW_DRYRUN:-0}" = "1" ]; then
+  log "DRYRUN: nao chamei o claude"
+  printf '{"resumo":"dryrun","achados":[]}' > "$WORK/out.json"
+else
+  CLAUDE=$(find_bin claude) || fail "claude nao encontrado"
+  # Somente leitura: nenhum Bash, nenhum Write, nenhuma rede. O resultado vem
+  # pelo stdout, o que dispensa dar Write ao LLM.
+  "$CLAUDE" -p "$PROMPT" \
+    --allowedTools Read Grep Glob \
+    --disallowedTools Bash Write Edit WebFetch WebSearch \
+    > "$WORK/raw.txt" 2>>"$HOME/Library/Logs/gh-inbox-action.log" \
+    || fail "a skill $SKILL retornou erro"
+  # tolera cercas de codigo, caso venham
+  sed -e 's/^```json//' -e 's/^```//' "$WORK/raw.txt" | "$JQ" -e . > "$WORK/out.json" 2>/dev/null \
+    || fail "a skill nao devolveu JSON valido (veja o log da acao)"
+fi
+
+# ---- cria o review PENDENTE ------------------------------------------------
+# UNICA escrita no GitHub em todo o fluxo, e ela nao monta `event`: o review
+# nasce PENDENTE e so a pessoa submete, na interface web.
+N_ACH=$("$JQ" '.achados | length' "$WORK/out.json")
+N_BLOQ=$("$JQ" '[.achados[] | select(.severidade=="bloqueante")] | length' "$WORK/out.json")
+
+"$JQ" '[.achados[] | select(.path != null and .line != null)
+       | {path, line, side: "RIGHT", body: ("**\(.severidade)** \(.corpo)")}]' \
+  "$WORK/out.json" > "$WORK/comments.json"
+
+BODY=$("$JQ" -r '.resumo' "$WORK/out.json")
+SOLTOS=$("$JQ" -r '[.achados[] | select(.path == null or .line == null) | "- \(.corpo)"] | join("\n")' "$WORK/out.json")
+[ -n "$SOLTOS" ] && BODY="$BODY
+
+Achados fora do diff:
+$SOLTOS"
+
+# O payload e montado aqui, explicitamente, com jq: `-F campo=@arquivo` leria o
+# arquivo como STRING e o GitHub recusa ("[] is not an array", 422).
+# Note que o objeto nao tem a chave `event` — e o que mantem o review PENDENTE.
+if [ "$("$JQ" 'length' "$WORK/comments.json")" -gt 0 ]; then
+  "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
+        --slurpfile c "$WORK/comments.json" \
+        '{commit_id: $commit, body: $body, comments: $c[0]}' > "$WORK/payload.json"
+else
+  "$JQ" -n --arg commit "$HEAD_SHA" --arg body "$BODY" \
+        '{commit_id: $commit, body: $body}' > "$WORK/payload.json"
+fi
+
+"$GH" api "repos/$REPO/pulls/$NUM/reviews" -X POST --input "$WORK/payload.json" \
+  > "$WORK/created.json" 2>>"$HOME/Library/Logs/gh-inbox-action.log" \
+  || fail "nao consegui criar o review pendente"
+
+STATE=$("$JQ" -r '.state // "?"' "$WORK/created.json")
+[ "$STATE" = "PENDING" ] || log "ATENCAO: review criado com state=$STATE (esperado PENDING)"
+"$JQ" -n --argjson a "$N_ACH" --argjson b "$N_BLOQ" '{achados:$a, bloqueantes:$b}' > "$RESULT"
+
+# ---- notifica o resultado --------------------------------------------------
+[ -f "$RESULT" ] || fail "a skill nao escreveu o resultado"
+A=$("$JQ" -r '.achados // "?"' "$RESULT" 2>/dev/null)
+B=$("$JQ" -r '.bloqueantes // 0' "$RESULT" 2>/dev/null)
+log "review pronto: $REPO#$NUM — $A achado(s), $B bloqueante(s)"
+notify "review pronto — $REPO#$NUM" \
+  "$A achado(s), $B bloqueante(s) · pendente, clique para ler e submeter no GitHub" \
+  "https://github.com/$REPO/pull/$NUM/files"

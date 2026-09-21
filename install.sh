@@ -98,9 +98,22 @@ mkdir -p "$BIN_DIR" "$SKILL_DIR" "$STATE_DIR" "$HOME/Library/LaunchAgents"
 # outros usuarios da maquina.
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 printf '%s' "$ORG" > "$STATE_DIR/org"   # para uso manual sem exportar variavel
+# Skill por bucket. Valor vazio = nao oferece review naquele bucket.
+if [ ! -f "$STATE_DIR/skills.conf" ]; then
+  cat > "$STATE_DIR/skills.conf" <<'SKILLS'
+PRIMEIRA=review-profundo
+RE_REVIEW=review-profundo
+# vazio = nao oferece review neste bucket
+MEU_PR=
+CI_VERMELHO=
+PRONTO=
+default=review-profundo
+SKILLS
+fi
 chmod 600 "$STATE_DIR"/* 2>/dev/null || true
 install -m 755 "$SRC/bin/gh-inbox" "$BIN_DIR/gh-inbox"
 install -m 755 "$SRC/bin/gh-inbox-poll" "$BIN_DIR/gh-inbox-poll"
+install -m 755 "$SRC/bin/gh-inbox-review" "$BIN_DIR/gh-inbox-review"
 install -m 644 "$SRC/skills/inbox/SKILL.md" "$SKILL_DIR/SKILL.md"
 ok "scripts em $BIN_DIR, skill /inbox em $SKILL_DIR"
 

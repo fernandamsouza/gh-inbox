@@ -154,10 +154,17 @@ TN=$(find_tn || true)
 # A primeira chamada de um bundle id novo BLOQUEIA esperando o prompt de
 # permissao do macOS (medido: 2min sem resposta). Sob launchd isso seguraria o
 # lock e travaria o ciclo, entao roda com teto de 5s e cai no osascript.
-notify() {  # titulo, subtitulo, corpo, url, group
+# O 6o argumento, opcional, e "ID:TITULO|comando": adiciona um botao no banner.
+# Vazio = banner sem botao (o fallback osascript nunca tem botao).
+notify() {  # titulo, subtitulo, corpo, url, group, [acao]
+  local acao_args=()
+  if [ -n "${6:-}" ]; then
+    local spec="${6%%|*}" cmd="${6#*|}"
+    acao_args=(-action "$spec" -action-exec "${spec%%:*}:$cmd")
+  fi
   if [ -n "$TN" ]; then
     ( "$TN" -title "$1" -subtitle "$2" -message "$3" -open "$4" -group "$5" \
-        >/dev/null 2>&1 ) &
+        "${acao_args[@]+"${acao_args[@]}"}" >/dev/null 2>&1 ) &
     local pid=$! w=0
     while kill -0 "$pid" 2>/dev/null && [ "$w" -lt 5 ]; do sleep 1; w=$((w+1)); done
     if kill -0 "$pid" 2>/dev/null; then
@@ -433,6 +440,16 @@ rotulo_atividade() {  # kind, meu(0/1)
   esac
 }
 
+# Botao "Revisar" so em evento de review pedido: nao faz sentido em atividade
+# no PR proprio (MEU_PR/PRONTO — merge e da pessoa) nem em mention.
+# Respeita skill vazia no conf; o proprio gh-inbox-review recusa nesse caso,
+# mas nao oferecer o botao evita o clique inutil.
+acao_review() {  # reason, repo, num -> "id:titulo|comando" ou vazio
+  [ "$1" = "review_requested" ] || return 0
+  [ -x "$HOME/.claude/bin/gh-inbox-review" ] || return 0
+  printf 'revisar:Revisar|%s/.claude/bin/gh-inbox-review %s %s' "$HOME" "$2" "$3"
+}
+
 label() {  # reason, repo, num
   case "$1" in
     assign) echo "te atribuiram"; return;;
@@ -465,7 +482,8 @@ if [ "${GH_INBOX_SEED:-0}" = "1" ]; then
 elif [ "$n" -eq 1 ]; then
   notify "gh-inbox" "$(label "$r" "${where%#*}" "${where#*#}") — $where" "${what:0:120}" \
          "https://github.com/${where%#*}/pull/${where#*#}" \
-         "ghinbox-$(printf '%s' "$where" | tr -c 'A-Za-z0-9' '-')"
+         "ghinbox-$(printf '%s' "$where" | tr -c 'A-Za-z0-9' '-')" \
+         "$(acao_review "$r" "${where%#*}" "${where#*#}")"
   log "notificou: 1 evento novo — $where"
 else
   # lote: um por PR, para cada um virar uma entrada propria no historico
@@ -475,7 +493,8 @@ else
     et=$(printf '%s' "$ev" | "$JQ" -r .title)
     notify "gh-inbox" "$(label "$er" "${ew%#*}" "${ew#*#}") — $ew" "${et:0:120}" \
            "https://github.com/${ew%#*}/pull/${ew#*#}" \
-           "ghinbox-$(printf '%s' "$ew" | tr -c 'A-Za-z0-9' '-')"
+           "ghinbox-$(printf '%s' "$ew" | tr -c 'A-Za-z0-9' '-')" \
+           "$(acao_review "$er" "${ew%#*}" "${ew#*#}")"
   done
   log "notificou: $n eventos novos (um banner cada) — primeiro: $where"
 fi
