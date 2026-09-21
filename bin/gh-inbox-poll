@@ -322,32 +322,127 @@ if [ "$n" -eq 0 ]; then
   exit 0
 fi
 
-# Um evento "author" quer dizer apenas "atividade no seu PR": approve,
-# changes-requested, comentario e push produzem o MESMO payload, porque o
-# subject.title da notificacao e o titulo do PR, nao o estado do review. Sem
-# olhar o review, o banner nao distingue elogio de pedido de mudanca.
-# Custo: 1 chamada REST por evento author (~2/dia nesta conta).
-estado_review() {  # repo, num -> rotulo
-  local st
-  st=$("$GH" api "repos/$1/pulls/$2/reviews" --jq \
-       '[.[] | select(.user.login != $ENV.ME)] | if length == 0 then "" else (last | .state) end' \
-       2>/dev/null) || st=""
-  case "$st" in
-    APPROVED)          echo "aprovado";;
-    CHANGES_REQUESTED) echo "mudancas pedidas";;
-    COMMENTED)         echo "comentario no review";;
-    DISMISSED)         echo "review dispensado";;
-    *)                 echo "no seu PR";;
+# O "reason" que o GitHub devolve e da THREAD inteira, nao do evento mais
+# recente: uma vez que a thread e "mention" (ou "author"), qualquer aprovacao,
+# comentario ou push novo continua chegando com esse MESMO reason, porque e
+# por causa dele que voce esta inscrita ali. So o updated_at muda. Sem olhar
+# o que de fato aconteceu por ultimo, um approve de amanha reaparece rotulado
+# "te marcaram" — visto no 806: mencionada as 17/09 21:43, approve as 18/09
+# 18:35, e o poller notificou "te marcaram" de novo as 18/09 16:30/19:29
+# porque o reason da thread nunca deixou de ser "mention".
+# Um evento NAO e necessariamente submissao de review: pode ser issue comment,
+# comentario de thread, push, label. Consultar so /pulls/N/reviews rotulava
+# errado — um comentario novo herdava o "aprovado" de um review antigo, porque
+# issue comment nao cria entrada em /reviews (visto no 6441: approve as 14:43
+# e o comentario que gerou a notificacao as 18:43).
+# Entao: le as tres fontes, usa a MAIS RECENTE, e testa se o texto dela cita
+# @ME de verdade. 3 chamadas REST por evento author/mention/team_mention/
+# comment — antes so author pagava esse custo; agora ~15-20/dia nesta conta.
+#
+# review_requested sofre do MESMO problema, so que sem texto pra checar: o
+# pedido de review fica registrado no timeline (evento "review_requested"),
+# e qualquer comentario/review depois disso tambem bate o updated_at da
+# thread sem gerar pedido novo nenhum — visto no data-collection#7038: pedida
+# as 17:26, PR recebeu 8 comentarios/reviews ate 19:47, e a notificacao das
+# 19:47 (que era so o comentario do iagodvsantos) ainda chegou rotulada
+# "review pedido". Por isso o terceiro parametro ($3=1) soma essa 4a fonte —
+# so pedido quem chamou com reason=review_requested paga a chamada extra.
+ultima_atividade() {  # repo, num, [com_pedido=0/1] -> "kind\tmarcou(true/false)"
+  local rev rev_t rev_rest rev_state rev_marcou
+  local com com_t com_marcou
+  local iss iss_t iss_marcou
+  local req_t=""
+  local novo kind marcou
+
+  rev=$("$GH" api "repos/$1/pulls/$2/reviews" --jq \
+        '[.[] | select(.user.login != $ENV.ME and .state != "PENDING")] | last
+         | if . == null then "" else "\(.submitted_at)|\(.state)|\((.body // "") | test("(?i)@" + $ENV.ME + "\\b"))" end' \
+        2>/dev/null) || rev=""
+  com=$("$GH" api "repos/$1/pulls/$2/comments" --jq \
+        '[.[] | select(.user.login != $ENV.ME)] | last
+         | if . == null then "" else "\(.created_at)|\((.body // "") | test("(?i)@" + $ENV.ME + "\\b"))" end' \
+        2>/dev/null) || com=""
+  iss=$("$GH" api "repos/$1/issues/$2/comments" --jq \
+        '[.[] | select(.user.login != $ENV.ME)] | last
+         | if . == null then "" else "\(.created_at)|\((.body // "") | test("(?i)@" + $ENV.ME + "\\b"))" end' \
+        2>/dev/null) || iss=""
+  if [ "${3:-0}" = "1" ]; then
+    req_t=$("$GH" api "repos/$1/issues/$2/timeline" --paginate --jq \
+            'select(.event == "review_requested") | .created_at' 2>/dev/null | tail -1) || req_t=""
+  fi
+
+  rev_t="${rev%%|*}"
+  rev_rest="${rev#*|}"
+  rev_state="${rev_rest%%|*}"
+  rev_marcou="${rev_rest#*|}"
+
+  com_t="${com%%|*}"
+  com_marcou="${com#*|}"
+
+  iss_t="${iss%%|*}"
+  iss_marcou="${iss#*|}"
+
+  # o mais recente entre as fontes decide o rotulo (ISO 8601 ordena como string)
+  novo="rev"
+  [ -n "$com_t" ] && [ "$com_t" \> "${rev_t:-}" ] && novo="com"
+  [ -n "$iss_t" ] && [ "$iss_t" \> "${rev_t:-}" ] && [ "$iss_t" \> "${com_t:-}" ] && novo="iss"
+  [ -n "$req_t" ] && [ "$req_t" \> "${rev_t:-}" ] && [ "$req_t" \> "${com_t:-}" ] && [ "$req_t" \> "${iss_t:-}" ] && novo="req"
+  [ -z "$rev_t" ] && [ -z "$com_t" ] && [ -z "$iss_t" ] && [ -z "$req_t" ] && novo="nada"
+
+  case "$novo" in
+    req)  kind="review_pedido";     marcou="false";;
+    com)  kind="comentario_diff";   marcou="${com_marcou:-false}";;
+    iss)  kind="comentario_thread"; marcou="${iss_marcou:-false}";;
+    nada) kind="nada";              marcou="false";;
+    rev)
+      marcou="${rev_marcou:-false}"
+      case "$rev_state" in
+        APPROVED)          kind="aprovado";;
+        CHANGES_REQUESTED) kind="mudancas_pedidas";;
+        COMMENTED)         kind="comentario_review";;
+        DISMISSED)         kind="review_dispensado";;
+        *)                 kind="nada";;
+      esac
+      ;;
+  esac
+
+  printf '%s\t%s' "$kind" "$marcou"
+}
+
+# Mesmo "kind" de atividade tem rotulo diferente dependendo do contexto: no
+# seu proprio PR (reason=author) faz sentido dizer "no seu PR"; num PR alheio
+# onde voce so foi mencionada ou comentou, isso confunde.
+rotulo_atividade() {  # kind, meu(0/1)
+  case "$1" in
+    aprovado)          echo "aprovado";;
+    mudancas_pedidas)  echo "mudancas pedidas";;
+    comentario_review) echo "comentario no review";;
+    review_dispensado) echo "review dispensado";;
+    comentario_diff)   echo "comentario no diff";;
+    comentario_thread) [ "$2" = "1" ] && echo "comentou no seu PR" || echo "comentario no PR";;
+    review_pedido)     echo "review pedido";;
+    *)                 [ "$2" = "1" ] && echo "no seu PR" || echo "atividade no PR";;
   esac
 }
 
 label() {  # reason, repo, num
   case "$1" in
-    review_requested) echo "review pedido";;
-    mention|team_mention) echo "te marcaram";;
-    comment) echo "comentario";;
-    author) estado_review "$2" "$3";;
-    assign) echo "te atribuiram";;
+    assign) echo "te atribuiram"; return;;
+  esac
+
+  local kind marcou
+  if [ "$1" = "review_requested" ]; then
+    IFS=$'\t' read -r kind marcou < <(ultima_atividade "$2" "$3" 1)
+  else
+    IFS=$'\t' read -r kind marcou < <(ultima_atividade "$2" "$3")
+  fi
+
+  case "$1" in
+    author) rotulo_atividade "$kind" 1;;
+    mention|team_mention)
+      if [ "$marcou" = "true" ]; then echo "te marcaram"; else rotulo_atividade "$kind" 0; fi
+      ;;
+    comment|review_requested) rotulo_atividade "$kind" 0;;
     *) echo "$1";;
   esac
 }
