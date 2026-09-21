@@ -35,12 +35,22 @@ fi
 DIR="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}"
 LM_FILE="$DIR/poll-last-modified"
 NSEEN="$DIR/notif-seen.json"
+# TTL em dias, nao contagem fixa: um cap de 500 chaves se esgotava em ~5 dias
+# numa conta movimentada (medido), e dali em diante uma thread que so teve
+# atividade antes desse ponto reaparecia como "nova" de novo — mesmo sintoma
+# do reason preso na thread, so que por capacidade em vez de rotulo. TTL
+# desacopla corretude de volume; o cap continua como valvula de seguranca para
+# uso patologico (conta rodando ha meses sem reiniciar).
+SEEN_TTL_DAYS="${GH_INBOX_SEEN_TTL_DAYS:-30}"
+SEEN_CAP="${GH_INBOX_SEEN_CAP:-5000}"
 TICK="$DIR/poll-tick"
 LOG="${GH_INBOX_LOG:-$HOME/Library/Logs/gh-inbox-poll.log}"
 
 # scan completo de estado a cada N ticks: CI vermelho nao gera notificacao no
 # GitHub, so aparece na consulta por estado.
 SCAN_EVERY="${GH_INBOX_SCAN_EVERY:-10}"
+
+SEEN_CUTOFF=$(date -u -v-"${SEEN_TTL_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)
 
 mkdir -p "$DIR" "$(dirname "$LOG")"
 [ -f "$NSEEN" ] || echo '{}' > "$NSEEN"
@@ -125,7 +135,7 @@ OSA=$(find_bin osascript) || die "osascript nao encontrado"
 # Launch Services o conhece, e ele nao indexa o Cellar do brew. Por isso o
 # install.sh copia o .app para ~/Applications e registra; as copias do brew
 # ficam como ultimo recurso (funcionam via fallback do osascript, nao clicam).
-# Preferencia: a copia com nome e icone proprios (make-icon.sh) vem primeiro,
+# Preferencia: a copia com nome e icone proprios (notifier/build.sh) vem primeiro,
 # para o banner aparecer como "gh-inbox". Depois a copia registrada em
 # ~/Applications, e por ultimo as do brew — que o Launch Services nao indexa e
 # portanto nunca conseguem pedir permissao.
@@ -329,9 +339,10 @@ if [ "$n" -eq 0 ]; then
   # nada a notificar, mas marca o que chegou para nao reprocessar
   tmp=$(mktemp)
   "$JQ" -n --slurpfile seen "$NSEEN" --argjson novos "$novos_todos" \
-        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cutoff "$SEEN_CUTOFF" --argjson cap "$SEEN_CAP" '
     (($seen[0] // {}) + (reduce $novos[] as $i ({}; .[$i.key] = $at)))
-    | to_entries | sort_by(.value) | (if length > 500 then .[-500:] else . end) | from_entries
+    | to_entries | map(select(.value >= $cutoff)) | sort_by(.value)
+    | (if length > $cap then .[-$cap:] else . end) | from_entries
   ' > "$tmp" && mv "$tmp" "$NSEEN"
   "$BIN" scan >/dev/null 2>&1
   exit 0
@@ -447,7 +458,11 @@ rotulo_atividade() {  # kind, meu(0/1)
 acao_review() {  # reason, repo, num -> "id:titulo|comando" ou vazio
   [ "$1" = "review_requested" ] || return 0
   [ -x "$HOME/.claude/bin/gh-inbox-review" ] || return 0
-  printf 'revisar:Revisar|%s/.claude/bin/gh-inbox-review %s %s' "$HOME" "$2" "$3"
+  # %q blinda: esta string vira comando real via `/bin/sh -c` no notifier (veja
+  # notifier.swift), entao repo/num tem que sair como tokens unicos mesmo que
+  # algum dia contenham espaco ou metacaractere — hoje o charset do GitHub nao
+  # permite, mas nao vale a pena depender disso.
+  printf 'revisar:Revisar|%s' "$(printf '%q %q %q' "$HOME/.claude/bin/gh-inbox-review" "$2" "$3")"
 }
 
 label() {  # reason, repo, num
@@ -501,9 +516,10 @@ fi
 
 tmp=$(mktemp)
 "$JQ" -n --slurpfile seen "$NSEEN" --argjson novos "${novos_todos:-$novos}" \
-      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cutoff "$SEEN_CUTOFF" --argjson cap "$SEEN_CAP" '
   (($seen[0] // {}) + (reduce $novos[] as $i ({}; .[$i.key] = $at)))
-  | to_entries | sort_by(.value) | (if length > 500 then .[-500:] else . end) | from_entries
+  | to_entries | map(select(.value >= $cutoff)) | sort_by(.value)
+  | (if length > $cap then .[-$cap:] else . end) | from_entries
 ' > "$tmp" && mv "$tmp" "$NSEEN"
 
 "$BIN" scan >/dev/null 2>&1 && log "queue atualizada"

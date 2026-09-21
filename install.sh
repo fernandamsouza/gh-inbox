@@ -94,6 +94,12 @@ NOTIFIER_BUNDLE="${NOTIFIER_BUNDLE:-io.github.fernandamsouza.gh-inbox}"
 
 # ---- arquivos -------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$SKILL_DIR" "$STATE_DIR" "$HOME/Library/LaunchAgents"
+# Pre-cria o log de acao (sem truncar se ja existir — instalador e idempotente):
+# o notifier.swift abre esse arquivo pra anexar o stdout/stderr do comando do
+# botao Revisar, e FileHandle(forWritingAtPath:) nao cria arquivo — so escreve
+# nele. Sem isso, a primeira execucao do botao perde esse log especifico (o
+# script ainda loga em gh-inbox-poll.log de qualquer forma).
+touch "$HOME/Library/Logs/gh-inbox-action.log" 2>/dev/null || true
 # Estado guarda titulos de PR internos e o login: nao deve ser legivel por
 # outros usuarios da maquina.
 chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -190,6 +196,6 @@ if [ "$WANT_TN" = "1" ]; then
   echo "  voce dispensar, em vez de sumir sozinho."
   echo
   echo "  O historico fica na Central de Notificacoes (clique no relogio),"
-  echo "  uma entrada por PR. Pelo terminal: terminal-notifier -list ALL"
+  echo "  uma entrada por PR. Pelo terminal: $TNBIN -list ALL"
   echo
 fi
