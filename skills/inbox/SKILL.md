@@ -21,8 +21,9 @@ sem ela escolher.**
 ~/.claude/bin/gh-inbox scan && ~/.claude/bin/gh-inbox list
 ```
 
-Mostre a fila como **widget clicável** (`mcp__visualize__show_widget`), não como
-tabela de texto — texto morto obriga a pessoa a digitar o número de volta. O widget deve ter:
+**Se a tool `mcp__visualize__show_widget` estiver disponível**, mostre a fila como
+widget clicável, não como tabela de texto — texto morto obriga a pessoa a digitar o
+número de volta. O widget deve ter:
 
 - cada `repo#num` como `<a href>` pro PR no GitHub
 - um botão por linha chamando `sendPrompt()`:
@@ -36,8 +37,13 @@ tabela de texto — texto morto obriga a pessoa a digitar o número de volta. O 
 - `menor primeiro` importa: o tamanho do diff é o que escala o custo do review, e
   quem usa isto costuma querer começar pelo mais barato
 
+**Se essa tool não estiver disponível** (ela não é padrão do Claude Code — é uma MCP
+específica), caia para uma tabela markdown com as mesmas colunas (bucket, `repo#num`
+como link, detalhe, título) na ordem do `list`, e diga em uma linha que a pessoa
+escolhe respondendo com o número ou o `repo#num`.
+
 Ordem default = a que o `list` devolve (ranqueada: trava-merge primeiro, trivial por
-último). Não reordene fora do widget. Não resuma a fila em prosa.
+último). Não reordene fora do widget/tabela. Não resuma a fila em prosa.
 
 Se a fila estiver vazia, diga isso em uma linha e pare — sem widget.
 
@@ -98,7 +104,8 @@ gh run view <run-id> --repo <repo> --log-failed
 ## 4. Ao terminar o review: widget de confirmação
 
 O `review-profundo` termina com um parecer em texto. **Não pare aí e não pergunte em
-prosa se pode postar.** Renderize um widget (`mcp__visualize__show_widget`) com:
+prosa se pode postar.** Se `mcp__visualize__show_widget` estiver disponível, renderize
+um widget com:
 
 - identificação do PR (repo#num, autor, tamanho) e a contagem de bloqueantes
 - **um cartão por achado**: severidade, `arquivo:linha`, a afirmação em uma linha, e o
@@ -114,6 +121,10 @@ prosa se pode postar.** Renderize um widget (`mcp__visualize__show_widget`) com:
   botão é **aprovar** — que **não** aprova nada: manda
   `"Não achei bloqueante no <repo>#<num>; me mostre o resumo pra eu decidir o approve"`.
   Aprovar é sempre da pessoa.
+
+Sem essa tool, liste os achados numerados (severidade, `arquivo:linha`, afirmação,
+cenário de falha) e pergunte em uma linha o que postar — mas **só posta com resposta
+explícita**, nunca por padrão.
 
 O clique no botão **é** o OK. Sem clique, nada vai pro PR. Nunca poste porque o
 review "ficou bom" nem porque o review foi pedido — pedir review não é autorizar
