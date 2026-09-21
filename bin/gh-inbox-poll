@@ -52,7 +52,8 @@ log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 # viraria dezenas de milhares de linhas em um ano.
 rotate_log() {
   local n
-  n=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+  [ -f "$LOG" ] || return 0     # instalacao nova: nada a rotacionar
+  n=$( { wc -l < "$LOG"; } 2>/dev/null || echo 0)
   if [ "$n" -gt 2000 ]; then
     tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
   fi
@@ -225,7 +226,14 @@ HDR=$(mktemp); BODY=$(mktemp)
 
 status=$(awk 'toupper($1) ~ /^HTTP/ {print $2}' "$HDR" | tail -1)
 [ "$status" = "304" ] && { ok_cycle; exit 0; }   # nada novo: caminho comum, custo zero
-[ "$status" = "200" ] || { log "HTTP $status inesperado"; exit 1; }
+# Passa por `die` de proposito: falha de rede persistente tem que contar para
+# o alerta de 3 ciclos, senao o poller morre calado — que e exatamente o modo
+# de falha que esse alerta existe para cobrir.
+if [ -z "$status" ]; then
+  die "a requisicao nao completou (rede? veja o err.log)"
+elif [ "$status" != "200" ]; then
+  die "HTTP $status inesperado"
+fi
 
 newlm=$(grep -i '^last-modified:' "$HDR" | tail -1 | cut -d' ' -f2- | tr -d '\r')
 [ -n "$newlm" ] && printf '%s' "$newlm" > "$LM_FILE"
