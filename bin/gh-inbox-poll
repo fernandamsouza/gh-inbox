@@ -191,6 +191,34 @@ end run
 AS
 }
 
+# Watch do review-profundo: PR que voce revisou e registrou com `gh-inbox watch`.
+# O scan poe em RE_REVIEW quando o autor responde (commit, comentario, review ou
+# edicao do corpo) depois do seu review; aqui isso vira banner, uma vez por
+# resposta nova. Mesmo grupo por PR do banner de evento, entao o "comentario no
+# PR" generico do mesmo ciclo e substituido pelo rotulo especifico. Custo zero:
+# so le a queue.json que o scan acabou de gravar. O botao "Revisar" e o mesmo do
+# review pedido: nada roda sem o clique.
+avisar_watch() {
+  local linhas repo num motivo title url rot acao
+  linhas=$("$BIN" watch-novos 2>>"$LOG") || return 0
+  [ -n "$linhas" ] || return 0
+  if [ "${GH_INBOX_SEED:-0}" = "1" ]; then log "seed: watch marcado sem notificar"; return 0; fi
+  while IFS=$'\t' read -r repo num motivo title url; do
+    [ -n "$repo" ] || continue
+    case "$motivo" in
+      resposta) rot="o autor respondeu ao seu review";;
+      commits)  rot="commits novos depois do seu review";;
+      *)        rot="o autor respondeu e subiu commits";;
+    esac
+    acao=""
+    [ -x "$HOME/.claude/bin/gh-inbox-review" ] && \
+      acao=$(printf 'revisar:Revisar|%s' "$(printf '%q %q %q' "$HOME/.claude/bin/gh-inbox-review" "$repo" "$num")")
+    notify "gh-inbox" "$rot — $repo#$num" "${title:0:120}" "$url" \
+           "ghinbox-$(printf '%s' "$repo#$num" | tr -c 'A-Za-z0-9' '-')" "$acao"
+    log "watch: $repo#$num ($motivo)"
+  done <<< "$linhas"
+}
+
 TOKEN=$("$GH" auth token 2>/dev/null) || die "gh nao esta autenticado"
 [ -n "$TOKEN" ] || die "token vazio"
 
@@ -227,6 +255,7 @@ if [ $(( tick % SCAN_EVERY )) -eq 0 ]; then
     echo '{}' > "$NSEEN"
   fi
   "$BIN" scan >/dev/null 2>&1 && log "scan periodico ok (tick $tick)"
+  avisar_watch
 fi
 
 LM=$(cat "$LM_FILE" 2>/dev/null || true)
@@ -345,6 +374,7 @@ if [ "$n" -eq 0 ]; then
     | (if length > $cap then .[-$cap:] else . end) | from_entries
   ' > "$tmp" && mv "$tmp" "$NSEEN"
   "$BIN" scan >/dev/null 2>&1
+  avisar_watch
   exit 0
 fi
 
@@ -523,5 +553,6 @@ tmp=$(mktemp)
 ' > "$tmp" && mv "$tmp" "$NSEEN"
 
 "$BIN" scan >/dev/null 2>&1 && log "queue atualizada"
+avisar_watch
 ok_cycle
 exit 0

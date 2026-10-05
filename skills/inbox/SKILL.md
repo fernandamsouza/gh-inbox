@@ -53,7 +53,8 @@ A pessoa escolhe por número, por repo ("os do repo X"), ou por bucket ("só os 
 Se não houver escolha, **pare aqui**. Não presuma "então roda todos".
 
 Antes de disparar mais de um item, avise quantos são e confirme — cada item roda
-`review-profundo`, que executa testes e linters de verdade.
+`review-profundo`, que lê o CI, o GitHub e os dados de cada PR (sem rodar nada
+localmente) e pode pedir OK para medir no banco.
 
 ## 3. Despachar
 
@@ -73,6 +74,13 @@ Isso imprime o compare do SHA do último review até o head — não o PR inteir
 Diga o que já tinha sido apontado antes (`prev_state` no item) e concentre o
 review no que mudou depois. O campo `rerequested` diz se houve pedido formal ou se
 foram só commits novos.
+
+Item com `watched: true` veio do watch que o `review-profundo` registra depois de
+postar. O campo `motivo` diz o que o autor fez depois do review (`prev_at`):
+`commits`, `resposta` (comentário, review ou edição do corpo, **sem** commit — o
+diff vem vazio, então leia as respostas dele desde `prev_at`) ou
+`commits+resposta`. Depois do re-review postado, o `review-profundo` registra o
+watch de novo.
 
 ### `PRONTO` — seu PR aprovado, CI verde, sem thread aberta
 Não é review nem diagnóstico. É o sinal de que **a pessoa** pode mergear. Diga qual PR,

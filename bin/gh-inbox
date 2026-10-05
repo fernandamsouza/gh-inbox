@@ -10,6 +10,10 @@
 #   mark    marca os itens atuais como vistos
 #   seed    scan + mark (usar 1x na instalacao: ignora o backlog)
 #   diff    <repo> <num>  delta desde o seu ultimo review (para re-review)
+#   watch   <repo> <num> [estado] [desde] [sha]  vigia a resposta do autor ao seu review
+#   unwatch <repo> <num>  para de vigiar
+#   watching              lista os PRs vigiados
+#   watch-novos           (poller) itens de watch ainda nao avisados, em TSV
 #
 # bash, nao zsh: zsh nao faz word splitting de variavel sem quote.
 set -euo pipefail
@@ -30,6 +34,10 @@ fi
 DIR="${GH_INBOX_DIR:-$HOME/.claude/gh-inbox}"
 QUEUE="$DIR/queue.json"
 SEEN="$DIR/seen.json"
+# watch.json: PRs revisados e registrados com `gh-inbox watch` (o review-profundo faz
+# isso depois de postar). watch-notified.json: respostas ja avisadas pelo poller.
+WATCH="$DIR/watch.json"
+WATCH_NOTIFIED="$DIR/watch-notified.json"
 
 mkdir -p "$DIR"
 [ -f "$SEEN" ] || echo '{}' > "$SEEN"
@@ -144,6 +152,84 @@ JQ_B='
             else "meupr:\(.repo)#\(.num)@\(.decision)+t\(.threads_abertos)+\(.ci)" end)
 ]'
 
+# D: watch. A Query C so ve PR com review FORMAL seu e commit novo depois dele. Ela
+# nao pega (1) resposta do autor SEM commit — comentario, review, edicao do corpo —
+# nem (2) PR revisado por comentario solto, que nao entra em reviewed-by. O watch
+# conta a atividade do AUTOR do PR depois do `since`, e commit novo de qualquer um.
+FRAG_W='fragment W on PullRequest {
+  number title url state isDraft headRefOid additions deletions updatedAt lastEditedAt
+  author { login }
+  editor { login }
+  comments(last: 30) { nodes { author { login } createdAt } }
+  reviews(last: 30) { nodes { author { login } submittedAt } }
+  reviewThreads(last: 30) { nodes { comments(last: 10) { nodes { author { login } createdAt } } } }
+}'
+
+JQ_D='
+($w[0] // {}) as $W
+| (.data // {}) as $D
+| [ $keys | to_entries[]
+    | .key as $i | $W[.value] as $e
+    | ($D["w\($i)"].pullRequest) as $p
+    | select($p != null and $p.state == "OPEN" and ($p.isDraft | not))
+    | ($p.author.login // "") as $au
+    | ([ ($p.comments.nodes[]? | select(.author.login == $au) | .createdAt),
+         ($p.reviews.nodes[]? | select(.author.login == $au) | .submittedAt),
+         ($p.reviewThreads.nodes[]?.comments.nodes[]? | select(.author.login == $au) | .createdAt),
+         (if (($p.editor.login // "") == $au) then $p.lastEditedAt else empty end)
+       ] | map(select(. != null and . > $e.since)) | sort | last) as $resp
+    | ($p.headRefOid != $e.sha) as $commits
+    | select($commits or $resp != null)
+    | { bucket: "RE_REVIEW",
+        repo: $e.repo, num: $e.num, title: $p.title, url: $p.url, author: $au,
+        adds: $p.additions, dels: $p.deletions,
+        head_sha: $p.headRefOid, base_sha: $e.sha,
+        prev_state: $e.state, prev_at: $e.since, updated: $p.updatedAt,
+        rerequested: false, trivial: false, watched: true,
+        motivo: (if $commits and $resp != null then "commits+resposta"
+                 elif $commits then "commits" else "resposta" end),
+        ultima_resposta: $resp }
+    | .key = "watch:\(.repo)#\(.num)@\(.head_sha[0:12])+\(.ultima_resposta // "-")" ]'
+
+# PR mergeado ou fechado sai do watch. So poda com resposta valida: falha de rede
+# (sem .data) nao apaga nada.
+JQ_D_FECHADOS='
+(.data // null) as $D
+| if $D == null then [] else
+  [ $keys | to_entries[]
+    | ($D["w\(.key)"].pullRequest) as $p
+    | select($p != null and ($p.state == "MERGED" or $p.state == "CLOSED"))
+    | .value ] end'
+
+scan_watch() {  # -> JSON array de itens RE_REVIEW; nunca falha o scan
+  [ -s "$WATCH" ] || { echo '[]'; return 0; }
+  local keys n i k repo num q resp fechados tmp
+  keys=$(jq -c 'keys' "$WATCH" 2>/dev/null) || { echo '[]'; return 0; }
+  n=$(printf '%s' "$keys" | jq 'length')
+  [ "$n" -gt 0 ] || { echo '[]'; return 0; }
+  q="query {"
+  for i in $(seq 0 $((n - 1))); do
+    k=$(printf '%s' "$keys" | jq -r ".[$i]")
+    repo=$(jq -r --arg k "$k" '.[$k].repo' "$WATCH")
+    num=$(jq -r --arg k "$k" '.[$k].num' "$WATCH")
+    q+=" w$i: repository(owner: \"${repo%%/*}\", name: \"${repo#*/}\") { pullRequest(number: $num) { ...W } }"
+  done
+  q+=" } $FRAG_W"
+  # gh sai com 1 quando a resposta tem "errors" (ex.: um repo sem acesso), mas o
+  # corpo ainda traz o .data dos outros: le assim mesmo.
+  resp=$(gh api graphql -f query="$q" 2>/dev/null || true)
+  printf '%s' "$resp" | jq -e '.data' >/dev/null 2>&1 || { echo '[]'; return 0; }
+
+  fechados=$(printf '%s' "$resp" | jq -c --argjson keys "$keys" "$JQ_D_FECHADOS")
+  if [ "$fechados" != "[]" ]; then
+    tmp=$(mktemp)
+    jq --argjson f "$fechados" 'with_entries(select(.key as $k | ($f | index($k)) | not))' "$WATCH" > "$tmp" \
+      && mv "$tmp" "$WATCH"
+  fi
+
+  printf '%s' "$resp" | jq -c --argjson keys "$keys" --slurpfile w "$WATCH" "$JQ_D" 2>/dev/null || echo '[]'
+}
+
 cmd_scan() {
   local a b c
   # A: review pedido a voce (pedido formal, inclui re-pedido)
@@ -161,17 +247,21 @@ cmd_scan() {
         -f q="is:pr is:open reviewed-by:@me org:$ORG" -f me="$ME") \
     || die "query C falhou"
 
-  local items_a items_b items_c
+  local items_a items_b items_c items_d
+  items_d=$(scan_watch)
   items_a=$(printf '%s' "$a" | jq -c --argjson rereq true "$JQ_A")
   items_b=$(printf '%s' "$b" | jq -c --arg me "$ME" "$JQ_B")
   items_c=$(printf '%s' "$c" | jq -c --argjson rereq false "$JQ_A")
 
   # A tem precedencia sobre C: se o review foi pedido formalmente, e esse o item
+  # Precedencia: A (re-pedido formal) > D (watch, sabe o motivo) > C
   jq -n --argjson a "$items_a" --argjson b "$items_b" --argjson c "$items_c" \
-        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        --argjson d "$items_d" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
     ([$a[] | "\(.repo)#\(.num)"] | map({key:., value:true}) | from_entries) as $ja
-    | ([$c[] | select(.bucket == "RE_REVIEW" and ($ja["\(.repo)#\(.num)"] | not))]) as $extra
-    | {scanned_at: $at, items: ($b + $a + $extra)}' > "$QUEUE.tmp" \
+    | ([$d[] | select($ja["\(.repo)#\(.num)"] | not)]) as $dd
+    | ($ja + ([$dd[] | "\(.repo)#\(.num)"] | map({key:., value:true}) | from_entries)) as $jad
+    | ([$c[] | select(.bucket == "RE_REVIEW" and ($jad["\(.repo)#\(.num)"] | not))]) as $extra
+    | {scanned_at: $at, items: ($b + $a + $dd + $extra)}' > "$QUEUE.tmp" \
     && mv "$QUEUE.tmp" "$QUEUE"
   # Escrita atomica: o plugin da barra e o /inbox leem esse arquivo a qualquer
   # momento. Redirecionar direto exporia um JSON pela metade.
@@ -203,8 +293,10 @@ def detail:
   elif .bucket == "CI_VERMELHO" then
     "checks falhando\(if .decision != "SEM_REVIEW" then ", \(.decision)" else "" end)"
   elif .bucket == "RE_REVIEW" then
-    "voce deu \(.prev_state); commits novos depois disso"
-    + (if .rerequested then " (re-pediram seu review)" else " (sem pedido formal)" end)
+    (if .motivo == "resposta" then "voce deu \(.prev_state); o autor respondeu depois disso (sem commit novo)"
+     elif .motivo == "commits+resposta" then "voce deu \(.prev_state); o autor respondeu e subiu commits depois disso"
+     else "voce deu \(.prev_state); commits novos depois disso" end)
+    + (if .rerequested then " (re-pediram seu review)" elif .watched then " [watch]" else " (sem pedido formal)" end)
   else
     "+\(.adds)/-\(.dels) por \(.author)\(if .trivial then " [trivial]" else "" end)"
   end;
@@ -290,6 +382,66 @@ cmd_diff() {
         (.files[] | "\n--- \(.filename) (+\(.additions)/-\(.deletions))\n\(.patch // "(sem patch: binario ou muito grande)")")'
 }
 
+# ---------------------------------------------------------------- watch
+
+cmd_watch() {
+  local repo="${1:-}" num="${2:-}" state="${3:-COMMENTED}" since="${4:-}" sha="${5:-}"
+  [ -n "$repo" ] && [ -n "$num" ] \
+    || die "uso: gh-inbox watch <owner/repo> <num> [COMMENTED|APPROVED|CHANGES_REQUESTED] [desde ISO8601] [sha]"
+  case "$num" in ''|*[!0-9]*) die "numero de PR invalido: $num";; esac
+  case "$repo" in */*) ;; *) die "repo deve ser owner/repo: $repo";; esac
+  local info st head
+  info=$(gh api "repos/$repo/pulls/$num" -q '"\(.head.sha) \(.state)"') || die "nao achei $repo#$num"
+  head=${info%% *}; st=${info#* }
+  [ "$st" = "open" ] || die "$repo#$num nao esta aberto ($st)"
+  [ -n "$sha" ] || sha="$head"
+  [ -n "$since" ] || since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  [ -f "$WATCH" ] || echo '{}' > "$WATCH"
+  local tmp; tmp=$(mktemp)
+  # Sobrescreve: registrar de novo depois de um re-review rearma o watch a partir dele.
+  jq --arg k "$repo#$num" --arg repo "$repo" --argjson num "$num" --arg since "$since" \
+     --arg sha "$sha" --arg state "$state" \
+     '.[$k] = {repo: $repo, num: $num, since: $since, sha: $sha, state: $state}' "$WATCH" > "$tmp" \
+    && mv "$tmp" "$WATCH"
+  echo "watch: $repo#$num desde $since (head ${sha:0:12}, voce deu $state)"
+}
+
+cmd_unwatch() {
+  local repo="${1:-}" num="${2:-}"
+  [ -n "$repo" ] && [ -n "$num" ] || die "uso: gh-inbox unwatch <owner/repo> <num>"
+  [ -f "$WATCH" ] || { echo "nada em watch"; return 0; }
+  local tmp; tmp=$(mktemp)
+  jq --arg k "$repo#$num" 'del(.[$k])' "$WATCH" > "$tmp" && mv "$tmp" "$WATCH"
+  echo "unwatch: $repo#$num"
+}
+
+cmd_watching() {
+  [ -s "$WATCH" ] || { echo "nada em watch"; return 0; }
+  jq -r 'if length == 0 then "nada em watch" else
+           (to_entries | sort_by(.value.since) | .[]
+            | "\(.key)  desde \(.value.since)  head \(.value.sha[0:12])  voce deu \(.value.state)") end' "$WATCH"
+}
+
+# Para o poller: imprime em TSV (repo, num, motivo, titulo, url) os itens de watch
+# da fila que ainda nao viraram banner, e marca como avisados. A chave do item
+# carrega o head e a hora da ultima resposta, entao cada resposta nova avisa uma vez.
+cmd_watch_novos() {
+  need_queue
+  [ -f "$WATCH_NOTIFIED" ] || echo '{}' > "$WATCH_NOTIFIED"
+  local at cutoff tmp
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  cutoff=$(date -u -v-30d +%Y-%m-%dT%H:%M:%SZ)
+  jq -r --slurpfile n "$WATCH_NOTIFIED" '
+    ($n[0] // {}) as $s
+    | .items[] | select(.watched == true and $s[.key] == null)
+    | [.repo, (.num | tostring), .motivo, (.title // ""), .url] | @tsv' "$QUEUE"
+  tmp=$(mktemp)
+  jq -n --slurpfile q "$QUEUE" --slurpfile n "$WATCH_NOTIFIED" --arg at "$at" --arg cutoff "$cutoff" '
+    ($n[0] // {}) as $old
+    | ($old + (reduce ($q[0].items[] | select(.watched == true)) as $i ({}; .[$i.key] = ($old[$i.key] // $at))))
+    | with_entries(select(.value >= $cutoff))' > "$tmp" && mv "$tmp" "$WATCH_NOTIFIED"
+}
+
 # ---------------------------------------------------------------- main
 
 case "${1:-help}" in
@@ -299,5 +451,9 @@ case "${1:-help}" in
   mark)   cmd_mark ;;
   seed)   cmd_seed ;;
   diff)   shift; cmd_diff "$@" ;;
-  *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  watch)       shift; cmd_watch "$@" ;;
+  unwatch)     shift; cmd_unwatch "$@" ;;
+  watching)    cmd_watching ;;
+  watch-novos) cmd_watch_novos ;;
+  *)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

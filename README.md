@@ -77,13 +77,15 @@ o histórico é preenchido.
 | | |
 |---|---|
 | banner | clique no corpo abre o PR no GitHub |
-| banner, botão **Revisar** | só em `review_requested` — dispara o review automático (veja *O botão Revisar*) |
+| banner, botão **Revisar** | em `review_requested` e quando o autor responde a um PR em watch — dispara o review automático (veja *O botão Revisar*) |
 | Central de Notificações | histórico, uma entrada por PR, cada uma clicável |
 | `/inbox` no Claude Code | fila clicável; escolhe e dispara o review completo, no chat |
 | `gh-inbox list` | a fila no terminal |
 | `gh-inbox scan` | recoleta e reclassifica |
 | `gh-inbox digest` | só o que é novo desde a última vez (exit 1 se nada) |
 | `gh-inbox diff <repo> <n>` | no re-review: só o delta desde o seu último review |
+| `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner |
+| `gh-inbox watching` / `unwatch <repo> <n>` | lista os PRs vigiados / para de vigiar (mergeado ou fechado sai sozinho) |
 | `gh-inbox mark` / `seed` | marca como visto / baseline inicial |
 
 Os binários ficam em `~/.claude/bin/`. O histórico pelo terminal:
@@ -99,7 +101,7 @@ Os binários ficam em `~/.claude/bin/`. O histórico pelo terminal:
 | `PRONTO` | seu PR aprovado, CI verde, sem thread aberta — dá pra mergear |
 | `MEU_PR` | seu PR com changes-requested ou thread esperando você |
 | `CI_VERMELHO` | checks falhando num PR seu |
-| `RE_REVIEW` | você já revisou e vieram commits novos — revisa **só o delta** |
+| `RE_REVIEW` | você já revisou e vieram commits novos — revisa **só o delta**. Em PR com `watch`, entra também quando o autor só respondeu, sem commit (`motivo` no item) |
 | `PRIMEIRA` | pediram seu review e você ainda não revisou |
 
 A ordem da tabela é a prioridade na fila: o que destrava merge primeiro, trivial por
