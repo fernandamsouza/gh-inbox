@@ -4,16 +4,21 @@
 #   ./install.sh                    poller + banners clicaveis com historico
 #   ./install.sh --no-notifier      so banner de aviso, sem instalar nada
 #   ./install.sh --org minhaorg     triagem restrita a outra org do GitHub
+#   ./install.sh --skill meu-review skill de review do botao Revisar e do /inbox
+#                                   (default: review-profundo; troca depois com
+#                                   `gh-inbox skill <nome>`)
 set -euo pipefail
 
 ORG=""          # sem default: detectado ou exigido, ver abaixo
 WANT_TN=1        # banners clicaveis + historico na Central: default
+REVIEW_SKILL=""  # vazio = mantem o skills.conf como esta (review-profundo na 1a vez)
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-notifier) WANT_TN=1 ;;
     --no-notifier)   WANT_TN=0 ;;
     --org) shift; ORG="${1:?--org precisa de um valor}" ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --skill) shift; REVIEW_SKILL="${1:?--skill precisa de um nome}" ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "opcao desconhecida: $1" >&2; exit 2 ;;
   esac
   shift
@@ -139,6 +144,13 @@ if [ ! -f "$REVIEW_SKILL_DIR/SKILL.md" ]; then
   ok "skill review-profundo em $REVIEW_SKILL_DIR"
 else
   info "review-profundo ja existe em $REVIEW_SKILL_DIR — mantida como esta"
+fi
+# --skill: mesma validacao do `gh-inbox skill` (a skill tem que existir). Falha
+# aqui nao derruba a instalacao — o resto ja esta no lugar, e trocar depois e
+# um comando so.
+if [ -n "$REVIEW_SKILL" ]; then
+  GH_INBOX_ORG="$ORG" "$BIN_DIR/gh-inbox" skill "$REVIEW_SKILL" \
+    || info "skill nao aplicada; rode depois: gh-inbox skill <nome>"
 fi
 
 # ---- LaunchAgent ----------------------------------------------------------

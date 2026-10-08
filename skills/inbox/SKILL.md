@@ -4,7 +4,8 @@ description: >
   Mostra a fila triada de PRs do GitHub que precisam de você (review pedido,
   re-review, seu PR com changes-requested, CI vermelho) e dispara o review do
   item escolhido. Use quando a pessoa pedir "/inbox", "o que tem pra revisar", "minha
-  fila de review", "o que tá esperando eu", "chegou coisa nova no github". Não use para
+  fila de review", "o que tá esperando eu", "chegou coisa nova no github", ou quando
+  pedir para ver ou trocar a skill do botão Revisar. Não use para
   revisar um PR específico que a pessoa já apontou — nesse caso vá direto na skill de
   review.
 ---
@@ -29,6 +30,19 @@ Sem `skills.conf`, use `review-profundo` (o default que o instalador grava). Val
 vazio num bucket = não ofereça review nele. Se a skill configurada não existir nesta
 instalação do Claude Code, diga isso em uma linha e pergunte qual usar — não troque
 por outra por conta própria.
+
+**Trocar a skill quando a pessoa pedir** ("usa a meu-review no Revisar", "qual skill o
+botão usa?", "tira o review do bucket MEU_PR"): não edite o arquivo, use o comando, que
+valida o nome antes de gravar:
+
+```bash
+~/.claude/bin/gh-inbox skill                         # mostra a atual e as instaladas
+~/.claude/bin/gh-inbox skill <nome>                  # PRIMEIRA, RE_REVIEW e default
+~/.claude/bin/gh-inbox skill <BUCKET> <nome|off>     # só um bucket
+```
+
+Repasse a saída em uma ou duas linhas, incluindo o aviso de watch se ele aparecer.
+Trocar a skill é pedido explícito da pessoa — nunca troque por iniciativa própria.
 
 ## 1. Atualizar e mostrar a fila
 

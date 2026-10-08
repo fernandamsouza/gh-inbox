@@ -46,6 +46,7 @@ searches would come back empty, with no error.
 ```bash
 ./install.sh --org myorg        # triage restricted to another GitHub org
 ./install.sh --no-notifier      # banner without click; doesn't build or install the notifier
+./install.sh --skill my-review  # review skill for the Revisar button and /inbox
 ```
 
 ### What the installer does
@@ -96,6 +97,7 @@ until you dismiss it. Either way the history is kept.
 | `gh-inbox digest` | only what's new since last time (exit 1 if nothing) |
 | `gh-inbox diff <repo> <n>` | on a re-review: only the delta since your last review |
 | `gh-inbox watch <repo> <n> [state]` | after reviewing: watches for the author's reply (commit, comment, review or description edit) and notifies with a banner. **Not automatic**: `review-profundo` calls it after posting; with another skill, see *Configuring the review skill* — the Revisar button doesn't register the watch |
+| `gh-inbox skill [bucket] [name\|off]` | shows or changes the review skill (see *Configuring the review skill*) |
 | `gh-inbox watching` / `unwatch <repo> <n>` | lists watched PRs / stops watching (merged or closed PRs leave on their own) |
 | `gh-inbox mark` / `seed` | mark as seen / initial baseline |
 
@@ -107,8 +109,23 @@ The binaries live in `~/.claude/bin/`. History from the terminal:
 
 ## Configuring the review skill
 
-Both the **Revisar** button and `/inbox` use the skill set in
-`~/.claude/gh-inbox/skills.conf`, one line per bucket:
+Both the **Revisar** button and `/inbox` use the review skill picked per bucket. The
+easy way is the `skill` command, which checks that the skill exists before saving:
+
+```bash
+gh-inbox skill                         # shows the current skill per bucket and the installed ones
+gh-inbox skill my-review               # use it everywhere (PRIMEIRA, RE_REVIEW and default)
+gh-inbox skill PRIMEIRA my-review      # only in one bucket
+gh-inbox skill MEU_PR off              # no review in that bucket
+```
+
+You can also pick it at install time with `./install.sh --skill my-review`, or just ask
+in `/inbox` ("use my-review on the Revisar button"). If the skill doesn't register the
+watch, the command warns you (see below). Changes apply on the next click, no
+reinstall.
+
+Under the hood it's a plain file, `~/.claude/gh-inbox/skills.conf`, one line per
+bucket, which you can also edit by hand:
 
 ```ini
 PRIMEIRA=review-profundo
@@ -126,12 +143,12 @@ default=review-profundo
   context, posts only blocking findings, and registers the PR in the **watch** at the
   end. The installer copies it to `~/.claude/skills/review-profundo/` **only if it
   doesn't exist yet**, so your own version is never overwritten.
-- **To use your own skill**, put its name in `skills.conf` (e.g. `PRIMEIRA=my-review`).
-  The skill has to exist in `~/.claude/skills/<name>/SKILL.md`. The file is read on
-  every click, so no reinstall is needed.
+- **To use your own skill**, run `gh-inbox skill <name>` (or put its name in
+  `skills.conf`). The skill has to exist in `~/.claude/skills/<name>/SKILL.md`.
 - **To use one skill for everything**, set `GH_INBOX_REVIEW_SKILL=<name>`; it overrides
   every line of `skills.conf`.
-- **To hide the button in a bucket**, leave its value empty.
+- **To hide the button in a bucket**, `gh-inbox skill <BUCKET> off` (or leave its value
+  empty).
 - **To get the watch with your own skill**, call this at the end of it, after the
   review is posted:
   ```bash

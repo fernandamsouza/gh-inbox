@@ -14,6 +14,9 @@
 #   unwatch <repo> <num>  para de vigiar
 #   watching              lista os PRs vigiados
 #   watch-novos           (poller) itens de watch ainda nao avisados, em TSV
+#   skill                 mostra a skill de review de cada bucket e as instaladas
+#   skill <nome>          usa <nome> no review (PRIMEIRA, RE_REVIEW e default)
+#   skill <bucket> <nome> so naquele bucket; <nome> = off tira o review dele
 #
 # bash, nao zsh: zsh nao faz word splitting de variavel sem quote.
 set -euo pipefail
@@ -442,6 +445,105 @@ cmd_watch_novos() {
     | with_entries(select(.value >= $cutoff))' > "$tmp" && mv "$tmp" "$WATCH_NOTIFIED"
 }
 
+# ---------------------------------------------------------------- skill
+# Skill de review por bucket, no skills.conf (lido pelo botao Revisar a cada
+# clique e pelo /inbox). O comando existe para ninguem precisar saber onde o
+# arquivo mora nem acertar o nome da skill de cabeca: valida antes de gravar.
+SKILLS_CONF="$DIR/skills.conf"
+SKILLS_HOME="$HOME/.claude/skills"
+SKILL_BUCKETS="PRIMEIRA RE_REVIEW MEU_PR CI_VERMELHO PRONTO default"
+
+skills_instaladas() {  # nomes com SKILL.md, um por linha
+  local d
+  for d in "$SKILLS_HOME"/*/; do
+    [ -f "$d/SKILL.md" ] && basename "$d"
+  done
+  return 0
+}
+
+skill_conf_garante() {  # cria o skills.conf com o default se nao existir
+  [ -f "$SKILLS_CONF" ] && return 0
+  printf '%s\n' 'PRIMEIRA=review-profundo' 'RE_REVIEW=review-profundo' \
+    '# vazio = nao oferece review neste bucket' 'MEU_PR=' 'CI_VERMELHO=' 'PRONTO=' \
+    'default=review-profundo' > "$SKILLS_CONF"
+}
+
+skill_conf_set() {  # bucket, valor (vazio = sem review)
+  local tmp; tmp=$(mktemp)
+  awk -v k="$1" -v v="$2" '
+    index($0, k "=") == 1 { if (!feito) print k "=" v; feito = 1; next }
+    { print }
+    END { if (!feito) print k "=" v }' "$SKILLS_CONF" > "$tmp" && mv "$tmp" "$SKILLS_CONF"
+}
+
+skill_valida() {  # nome -> morre listando as instaladas se nao existir
+  [ -f "$SKILLS_HOME/$1/SKILL.md" ] && return 0
+  printf 'gh-inbox: skill "%s" nao encontrada em %s\n' "$1" "$SKILLS_HOME" >&2
+  printf 'instaladas:\n' >&2
+  skills_instaladas | sed 's/^/  /' >&2
+  exit 2
+}
+
+skill_avisa_watch() {  # nome -> aviso se a skill nao registra o watch
+  grep -q 'gh-inbox watch' "$SKILLS_HOME/$1/SKILL.md" 2>/dev/null && return 0
+  printf 'aviso: "%s" nao chama `gh-inbox watch` — sem isso, o PR revisado nao entra no watch.\n' "$1"
+  printf '       adicione no fim da skill: ~/.claude/bin/gh-inbox watch <owner/repo> <num> <COMMENTED|APPROVED>\n'
+}
+
+cmd_skill() {
+  skill_conf_garante
+  if [ $# -eq 0 ]; then
+    local b v
+    echo "skill de review por bucket ($SKILLS_CONF):"
+    for b in $SKILL_BUCKETS; do
+      v=$(grep -E "^$b=" "$SKILLS_CONF" | head -1 | cut -d= -f2- || true)
+      printf '  %-12s %s\n' "$b" "${v:-(sem review)}"
+    done
+    [ -n "${GH_INBOX_REVIEW_SKILL:-}" ] && \
+      echo "  GH_INBOX_REVIEW_SKILL=$GH_INBOX_REVIEW_SKILL esta definida e vale para todos"
+    echo
+    echo "instaladas em $SKILLS_HOME (* = registra o watch):"
+    skills_instaladas | while read -r b; do
+      if grep -q 'gh-inbox watch' "$SKILLS_HOME/$b/SKILL.md" 2>/dev/null; then
+        echo "  * $b"; else echo "    $b"; fi
+    done
+    echo
+    echo "trocar: gh-inbox skill <nome>   |   so um bucket: gh-inbox skill <bucket> <nome|off>"
+    return 0
+  fi
+
+  local bucket nome
+  if [ $# -eq 1 ]; then
+    nome="$1"
+    if [ "$nome" = "off" ]; then
+      for bucket in PRIMEIRA RE_REVIEW default; do skill_conf_set "$bucket" ""; done
+      echo "review desligado em PRIMEIRA, RE_REVIEW e default (o botao Revisar some)"
+      return 0
+    fi
+    skill_valida "$nome"
+    for bucket in PRIMEIRA RE_REVIEW default; do skill_conf_set "$bucket" "$nome"; done
+    echo "skill de review: $nome (PRIMEIRA, RE_REVIEW e default)"
+  else
+    bucket="$1"; nome="$2"
+    case " $SKILL_BUCKETS " in
+      *" $bucket "*) ;;
+      *) die "bucket desconhecido: $bucket (use: $SKILL_BUCKETS)" ;;
+    esac
+    if [ "$nome" = "off" ]; then
+      skill_conf_set "$bucket" ""
+      echo "$bucket: sem review"
+      return 0
+    fi
+    skill_valida "$nome"
+    skill_conf_set "$bucket" "$nome"
+    echo "$bucket: $nome"
+  fi
+  [ -n "${GH_INBOX_REVIEW_SKILL:-}" ] && \
+    echo "aviso: GH_INBOX_REVIEW_SKILL=$GH_INBOX_REVIEW_SKILL esta definida e passa por cima do skills.conf"
+  skill_avisa_watch "$nome"
+  echo "vale a partir do proximo clique, sem reinstalar."
+}
+
 # ---------------------------------------------------------------- main
 
 case "${1:-help}" in
@@ -455,5 +557,6 @@ case "${1:-help}" in
   unwatch)     shift; cmd_unwatch "$@" ;;
   watching)    cmd_watching ;;
   watch-novos) cmd_watch_novos ;;
-  *)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  skill)       shift; cmd_skill "$@" ;;
+  *)      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

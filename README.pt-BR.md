@@ -42,6 +42,7 @@ sem erro.
 ```bash
 ./install.sh --org minhaorg     # triagem restrita a outra org do GitHub
 ./install.sh --no-notifier      # banner sem clique; não compila nem instala o notificador
+./install.sh --skill meu-review # skill de review do botão Revisar e do /inbox
 ```
 
 ### O que o instalador faz
@@ -92,6 +93,7 @@ o histórico é preenchido.
 | `gh-inbox digest` | só o que é novo desde a última vez (exit 1 se nada) |
 | `gh-inbox diff <repo> <n>` | no re-review: só o delta desde o seu último review |
 | `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner. **Não liga sozinho**: a `review-profundo` chama depois de postar; com outra skill, veja *Configurar a skill de review* — o botão Revisar não registra o watch |
+| `gh-inbox skill [bucket] [nome\|off]` | mostra ou troca a skill de review (veja *Configurar a skill de review*) |
 | `gh-inbox watching` / `unwatch <repo> <n>` | lista os PRs vigiados / para de vigiar (mergeado ou fechado sai sozinho) |
 | `gh-inbox mark` / `seed` | marca como visto / baseline inicial |
 
@@ -103,8 +105,22 @@ Os binários ficam em `~/.claude/bin/`. O histórico pelo terminal:
 
 ## Configurar a skill de review
 
-O botão **Revisar** e o `/inbox` usam a skill definida em
-`~/.claude/gh-inbox/skills.conf`, uma linha por bucket:
+O botão **Revisar** e o `/inbox` usam a skill de review escolhida por bucket. O jeito
+fácil é o comando `skill`, que confere se a skill existe antes de gravar:
+
+```bash
+gh-inbox skill                         # mostra a skill de cada bucket e as instaladas
+gh-inbox skill meu-review              # usa em tudo (PRIMEIRA, RE_REVIEW e default)
+gh-inbox skill PRIMEIRA meu-review     # só num bucket
+gh-inbox skill MEU_PR off              # sem review nesse bucket
+```
+
+Também dá para escolher na instalação, com `./install.sh --skill meu-review`, ou pedir
+no próprio `/inbox` ("usa a meu-review no botão Revisar"). Se a skill não registra o
+watch, o comando avisa (veja abaixo). Vale a partir do próximo clique, sem reinstalar.
+
+Por baixo é um arquivo simples, `~/.claude/gh-inbox/skills.conf`, uma linha por
+bucket, que também dá para editar à mão:
 
 ```ini
 PRIMEIRA=review-profundo
@@ -122,12 +138,12 @@ default=review-profundo
   posta só os bloqueantes e registra o PR no **watch** no fim. O instalador copia para
   `~/.claude/skills/review-profundo/` **só se ainda não existir**, então a sua versão
   nunca é sobrescrita.
-- **Para usar a sua skill**, ponha o nome dela no `skills.conf` (ex.:
-  `PRIMEIRA=meu-review`). Ela precisa existir em `~/.claude/skills/<nome>/SKILL.md`. O
-  arquivo é lido a cada clique, então não precisa reinstalar.
+- **Para usar a sua skill**, rode `gh-inbox skill <nome>` (ou ponha o nome dela no
+  `skills.conf`). Ela precisa existir em `~/.claude/skills/<nome>/SKILL.md`.
 - **Para uma skill só em tudo**, defina `GH_INBOX_REVIEW_SKILL=<nome>`; ela sobrescreve
   todas as linhas do `skills.conf`.
-- **Para esconder o botão num bucket**, deixe o valor vazio.
+- **Para esconder o botão num bucket**, `gh-inbox skill <BUCKET> off` (ou deixe o valor
+  vazio).
 - **Para ter o watch com a sua skill**, chame isto no fim dela, depois de postar o
   review:
   ```bash
