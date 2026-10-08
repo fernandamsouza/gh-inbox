@@ -5,8 +5,8 @@
 #   ./install.sh --no-notifier      so banner de aviso, sem instalar nada
 #   ./install.sh --org minhaorg     triagem restrita a outra org do GitHub
 #   ./install.sh --skill meu-review skill de review do botao Revisar e do /inbox
-#                                   (default: review-profundo; troca depois com
-#                                   `gh-inbox skill <nome>`)
+#                                   (default: review-profundo; para trocar depois,
+#                                   rode de novo com outro nome)
 set -euo pipefail
 
 ORG=""          # sem default: detectado ou exigido, ver abaixo
@@ -150,7 +150,7 @@ fi
 # um comando so.
 if [ -n "$REVIEW_SKILL" ]; then
   GH_INBOX_ORG="$ORG" "$BIN_DIR/gh-inbox" skill "$REVIEW_SKILL" \
-    || info "skill nao aplicada; rode depois: gh-inbox skill <nome>"
+    || info "skill nao aplicada; rode de novo: ./install.sh --skill <nome>"
 fi
 
 # ---- LaunchAgent ----------------------------------------------------------
