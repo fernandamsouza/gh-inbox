@@ -1,5 +1,7 @@
 # gh-inbox
 
+https://github.com/user-attachments/assets/76c4ed73-9f4b-4137-82e8-56af2e0ab86c
+
 Para de abrir o GitHub para *descobrir* o que precisa de você.
 
 Um poller local avisa em ≤60s quando pedem seu review, te marcam ou mexem no seu PR.
