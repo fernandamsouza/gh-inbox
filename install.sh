@@ -130,6 +130,16 @@ install -m 755 "$SRC/bin/gh-inbox-poll" "$BIN_DIR/gh-inbox-poll"
 install -m 755 "$SRC/bin/gh-inbox-review" "$BIN_DIR/gh-inbox-review"
 install -m 644 "$SRC/skills/inbox/SKILL.md" "$SKILL_DIR/SKILL.md"
 ok "scripts em $BIN_DIR, skill /inbox em $SKILL_DIR"
+# Skill de review default do skills.conf. So instala se nao existir: quem ja tem
+# uma review-profundo propria (adaptada ao seu ambiente) nao perde a dela.
+REVIEW_SKILL_DIR="$HOME/.claude/skills/review-profundo"
+if [ ! -f "$REVIEW_SKILL_DIR/SKILL.md" ]; then
+  mkdir -p "$REVIEW_SKILL_DIR"
+  install -m 644 "$SRC/skills/review-profundo/SKILL.md" "$REVIEW_SKILL_DIR/SKILL.md"
+  ok "skill review-profundo em $REVIEW_SKILL_DIR"
+else
+  info "review-profundo ja existe em $REVIEW_SKILL_DIR — mantida como esta"
+fi
 
 # ---- LaunchAgent ----------------------------------------------------------
 cat > "$PLIST" <<PLIST_EOF

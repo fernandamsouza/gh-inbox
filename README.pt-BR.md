@@ -51,8 +51,9 @@ sem erro.
    sem brew, sem dependência externa) e registra o `.app` em `~/Applications` no Launch
    Services (esse registro é obrigatório — veja *Problemas conhecidos*); se `swiftc` não
    existir ou o build falhar, cai para banner sem clique
-3. instala os scripts em `~/.claude/bin`, a skill `/inbox` e o `skills.conf` (mapeia
-   bucket → skill do botão Revisar — veja *O botão Revisar*)
+3. instala os scripts em `~/.claude/bin`, a skill `/inbox`, a skill `review-profundo`
+   (só se você ainda não tiver uma) e o `skills.conf` (mapeia bucket → skill de review —
+   veja *Configurar a skill de review*)
 4. gera o LaunchAgent com o seu `$HOME` e carrega (poll de 60s)
 5. **semeia o baseline**: o que já existe hoje entra como visto, então você só é
    avisada do que for novo a partir da instalação
@@ -90,7 +91,7 @@ o histórico é preenchido.
 | `gh-inbox scan` | recoleta e reclassifica |
 | `gh-inbox digest` | só o que é novo desde a última vez (exit 1 se nada) |
 | `gh-inbox diff <repo> <n>` | no re-review: só o delta desde o seu último review |
-| `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner. **Não liga sozinho**: rode à mão ou chame no fim da sua skill de review — o botão Revisar não registra o watch |
+| `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner. **Não liga sozinho**: a `review-profundo` chama depois de postar; com outra skill, veja *Configurar a skill de review* — o botão Revisar não registra o watch |
 | `gh-inbox watching` / `unwatch <repo> <n>` | lista os PRs vigiados / para de vigiar (mergeado ou fechado sai sozinho) |
 | `gh-inbox mark` / `seed` | marca como visto / baseline inicial |
 
@@ -99,6 +100,47 @@ Os binários ficam em `~/.claude/bin/`. O histórico pelo terminal:
 ```bash
 ~/Applications/gh-inbox.app/Contents/MacOS/notifier -list ALL
 ```
+
+## Configurar a skill de review
+
+O botão **Revisar** e o `/inbox` usam a skill definida em
+`~/.claude/gh-inbox/skills.conf`, uma linha por bucket:
+
+```ini
+PRIMEIRA=review-profundo
+RE_REVIEW=review-profundo
+# vazio = nao oferece review neste bucket
+MEU_PR=
+CI_VERMELHO=
+PRONTO=
+default=review-profundo
+```
+
+- **O default é a `review-profundo`**, que vem neste repo
+  ([`skills/review-profundo/SKILL.md`](skills/review-profundo/SKILL.md)): review com
+  verificação antes de opinião — lê o CI, o código no head e o contexto do GitHub,
+  posta só os bloqueantes e registra o PR no **watch** no fim. O instalador copia para
+  `~/.claude/skills/review-profundo/` **só se ainda não existir**, então a sua versão
+  nunca é sobrescrita.
+- **Para usar a sua skill**, ponha o nome dela no `skills.conf` (ex.:
+  `PRIMEIRA=meu-review`). Ela precisa existir em `~/.claude/skills/<nome>/SKILL.md`. O
+  arquivo é lido a cada clique, então não precisa reinstalar.
+- **Para uma skill só em tudo**, defina `GH_INBOX_REVIEW_SKILL=<nome>`; ela sobrescreve
+  todas as linhas do `skills.conf`.
+- **Para esconder o botão num bucket**, deixe o valor vazio.
+- **Para ter o watch com a sua skill**, chame isto no fim dela, depois de postar o
+  review:
+  ```bash
+  ~/.claude/bin/gh-inbox watch <owner/repo> <num> <COMMENTED|APPROVED>
+  ```
+  O botão Revisar nunca registra o watch sozinho, porque ele só cria um review
+  pendente — quem submete é você.
+
+**Botão × `/inbox`.** O `/inbox` roda a skill inteira, com as ferramentas que ela
+precisar. O botão roda uma versão blindada, só sobre o diff: o `claude -p` recebe o
+*nome* da skill e aplica o método ao diff colado, sem nenhuma ferramenta (veja *O botão
+Revisar*). Mesmo método, resultado mais raso — use o `/inbox` quando o PR merecer o
+review completo.
 
 ## O que ele classifica
 
@@ -278,8 +320,8 @@ um PR em watch. O clique roda
 `gh-inbox-review <repo> <num>`, que:
 
 1. busca PR e diff via `gh` (sem clonar o repo)
-2. manda tudo pro `claude -p`, com a skill do `skills.conf` (por bucket — vazio desliga
-   o botão naquele bucket; `default` cobre o resto)
+2. manda tudo pro `claude -p`, com a skill do `skills.conf` (por bucket — veja
+   *Configurar a skill de review*)
 3. cria um review **PENDENTE** no PR com os achados — nunca submete
 
 Dois invariantes que nenhum caminho do script pode violar: **só roda por clique

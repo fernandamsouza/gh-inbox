@@ -15,6 +15,15 @@ launchctl unload "$PLIST" 2>/dev/null || true
 rm -f "$PLIST"
 rm -f "$HOME/.claude/bin/gh-inbox" "$HOME/.claude/bin/gh-inbox-poll" "$HOME/.claude/bin/gh-inbox-review"
 rm -rf "$HOME/.claude/skills/inbox"
+# review-profundo: so remove se for a copia instalada por este repo, intacta.
+# Se a pessoa adaptou (ou ja tinha a dela antes), fica.
+SRC="$(cd "$(dirname "$0")" && pwd)"
+RP="$HOME/.claude/skills/review-profundo/SKILL.md"
+if [ -f "$RP" ] && cmp -s "$RP" "$SRC/skills/review-profundo/SKILL.md"; then
+  rm -rf "$HOME/.claude/skills/review-profundo"
+elif [ -f "$RP" ]; then
+  echo "review-profundo mantida (difere da versao do repo): $RP"
+fi
 rm -rf "$HOME/Applications/gh-inbox.app"                   # notificador proprio
 rm -rf "$HOME/Applications/terminal-notifier.app"          # fallback, se existir
 rm -rf "$HOME/.claude/gh-inbox/.lock"                       # lock orfao

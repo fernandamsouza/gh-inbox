@@ -55,8 +55,9 @@ searches would come back empty, with no error.
    no brew, no external dependency) and registers the `.app` in `~/Applications` with
    Launch Services (this registration is required — see *Known issues*); if `swiftc` is
    missing or the build fails, it falls back to a non-clickable banner
-3. installs the scripts in `~/.claude/bin`, the `/inbox` skill and `skills.conf` (maps
-   bucket → skill used by the Revisar button — see *The Revisar button*)
+3. installs the scripts in `~/.claude/bin`, the `/inbox` skill, the `review-profundo`
+   skill (only if you don't have one already) and `skills.conf` (maps bucket → review
+   skill — see *Configuring the review skill*)
 4. generates the LaunchAgent with your `$HOME` and loads it (60s poll)
 5. **seeds the baseline**: everything that exists today is marked as seen, so you are
    only notified about what's new from install onwards
@@ -94,7 +95,7 @@ until you dismiss it. Either way the history is kept.
 | `gh-inbox scan` | re-collects and re-classifies |
 | `gh-inbox digest` | only what's new since last time (exit 1 if nothing) |
 | `gh-inbox diff <repo> <n>` | on a re-review: only the delta since your last review |
-| `gh-inbox watch <repo> <n> [state]` | after reviewing: watches for the author's reply (commit, comment, review or description edit) and notifies with a banner. **Not automatic**: run it by hand or call it at the end of your review skill — the Revisar button doesn't register the watch |
+| `gh-inbox watch <repo> <n> [state]` | after reviewing: watches for the author's reply (commit, comment, review or description edit) and notifies with a banner. **Not automatic**: `review-profundo` calls it after posting; with another skill, see *Configuring the review skill* — the Revisar button doesn't register the watch |
 | `gh-inbox watching` / `unwatch <repo> <n>` | lists watched PRs / stops watching (merged or closed PRs leave on their own) |
 | `gh-inbox mark` / `seed` | mark as seen / initial baseline |
 
@@ -103,6 +104,46 @@ The binaries live in `~/.claude/bin/`. History from the terminal:
 ```bash
 ~/Applications/gh-inbox.app/Contents/MacOS/notifier -list ALL
 ```
+
+## Configuring the review skill
+
+Both the **Revisar** button and `/inbox` use the skill set in
+`~/.claude/gh-inbox/skills.conf`, one line per bucket:
+
+```ini
+PRIMEIRA=review-profundo
+RE_REVIEW=review-profundo
+# empty = no review offered in this bucket
+MEU_PR=
+CI_VERMELHO=
+PRONTO=
+default=review-profundo
+```
+
+- **The default is `review-profundo`**, shipped in this repo
+  ([`skills/review-profundo/SKILL.md`](skills/review-profundo/SKILL.md)): a
+  verification-first review that reads CI, the code at the head commit and the GitHub
+  context, posts only blocking findings, and registers the PR in the **watch** at the
+  end. The installer copies it to `~/.claude/skills/review-profundo/` **only if it
+  doesn't exist yet**, so your own version is never overwritten.
+- **To use your own skill**, put its name in `skills.conf` (e.g. `PRIMEIRA=my-review`).
+  The skill has to exist in `~/.claude/skills/<name>/SKILL.md`. The file is read on
+  every click, so no reinstall is needed.
+- **To use one skill for everything**, set `GH_INBOX_REVIEW_SKILL=<name>`; it overrides
+  every line of `skills.conf`.
+- **To hide the button in a bucket**, leave its value empty.
+- **To get the watch with your own skill**, call this at the end of it, after the
+  review is posted:
+  ```bash
+  ~/.claude/bin/gh-inbox watch <owner/repo> <num> <COMMENTED|APPROVED>
+  ```
+  The Revisar button never registers the watch on its own, because it only creates a
+  pending review — you're the one who submits it.
+
+**Button vs `/inbox`.** `/inbox` runs the skill in full, with every tool it needs. The
+button runs a sandboxed, diff-only version: `claude -p` gets the skill's *name* and
+applies its method to the pasted diff, with no tools (see *The Revisar button*). Same
+method, shallower result — use `/inbox` when the PR deserves the full review.
 
 ## What it classifies
 
@@ -283,8 +324,8 @@ The **Revisar** ("Review") button shows up on two banners: `review_requested` an
 author's reply on a watched PR. Clicking it runs `gh-inbox-review <repo> <num>`, which:
 
 1. fetches the PR and its diff via `gh` (without cloning the repo)
-2. sends it all to `claude -p`, with the skill from `skills.conf` (per bucket — empty
-   disables the button for that bucket; `default` covers the rest)
+2. sends it all to `claude -p`, with the skill from `skills.conf` (per bucket — see
+   *Configuring the review skill*)
 3. creates a **PENDING** review on the PR with the findings — it never submits
 
 Two invariants no code path in the script may break: **it only runs on an explicit
@@ -300,7 +341,7 @@ model would read; so even if the diff contains a hidden instruction like "read
 this hardening the output (which becomes a review comment, via the API) would be a path
 for exfiltrating a local file through a malicious PR.
 
-Because it's diff-only, the automatic review is **shallower** than a full review run
+Because it's diff-only, the automatic review is **shallower** than the full review run
 via `/inbox`: it doesn't run tests or linters, and the prompt tells the model to say so
 in the summary. It references the skill from `skills.conf` by name but doesn't actually
 invoke it (the `Skill` tool isn't allowed either) — it's the method applied only to

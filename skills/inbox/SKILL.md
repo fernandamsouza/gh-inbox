@@ -15,6 +15,21 @@ Frontend do triador `~/.claude/bin/gh-inbox`. O triador é shell puro (custo zer
 esta skill só lê a fila e despacha o que a pessoa escolher. **Nada de review dispara
 sem ela escolher.**
 
+## 0. Qual skill de review usar
+
+A skill de review vem do `~/.claude/gh-inbox/skills.conf`, por bucket (`PRIMEIRA=`,
+`RE_REVIEW=`, …, e `default=` para o resto). A variável `GH_INBOX_REVIEW_SKILL`, se
+existir, vale para todos os buckets. Abaixo, **`<skill>`** é esse valor:
+
+```bash
+grep -E '^(PRIMEIRA|RE_REVIEW|default)=' ~/.claude/gh-inbox/skills.conf
+```
+
+Sem `skills.conf`, use `review-profundo` (o default que o instalador grava). Valor
+vazio num bucket = não ofereça review nele. Se a skill configurada não existir nesta
+instalação do Claude Code, diga isso em uma linha e pergunte qual usar — não troque
+por outra por conta própria.
+
 ## 1. Atualizar e mostrar a fila
 
 ```bash
@@ -27,7 +42,7 @@ número de volta. O widget deve ter:
 
 - cada `repo#num` como `<a href>` pro PR no GitHub
 - um botão por linha chamando `sendPrompt()`:
-  - bucket `PRIMEIRA`/`RE_REVIEW` → `"Roda o review-profundo no <repo>#<num>"` (o `repo` do item já vem
+  - bucket `PRIMEIRA`/`RE_REVIEW` → `"Roda a <skill> no <repo>#<num>"` (o `repo` do item já vem
     com a org)
   - bucket `MEU_PR` → `"Lê os comentários que recebi no meu PR <...> e me propõe o ajuste"`
   - bucket `CI_VERMELHO` → `"Diagnostica o CI vermelho do <...>"`
@@ -52,19 +67,19 @@ Se a fila estiver vazia, diga isso em uma linha e pare — sem widget.
 A pessoa escolhe por número, por repo ("os do repo X"), ou por bucket ("só os meus PRs").
 Se não houver escolha, **pare aqui**. Não presuma "então roda todos".
 
-Antes de disparar mais de um item, avise quantos são e confirme — cada item roda
-`review-profundo`, que lê o CI, o GitHub e os dados de cada PR (sem rodar nada
-localmente) e pode pedir OK para medir no banco.
+Antes de disparar mais de um item, avise quantos são e confirme — cada item roda a
+`<skill>` inteira (a `review-profundo`, por exemplo, lê o CI, o GitHub e os dados de
+cada PR e pode pedir OK para medir no banco).
 
 ## 3. Despachar
 
 Os buckets vêm no `queue.json` (`~/.claude/gh-inbox/queue.json`).
 
 ### `PRIMEIRA` — review pedido, você ainda não revisou
-Invoque a skill **`review-profundo`** no PR (`repo` + `num` do item).
+Invoque a **`<skill>`** do bucket no PR (`repo` + `num` do item).
 
 ### `RE_REVIEW` — você já revisou e vieram commits novos
-Invoque **`review-profundo`**, mas alimentada **só com o delta**:
+Invoque a **`<skill>`** do bucket, mas alimentada **só com o delta**:
 
 ```bash
 ~/.claude/bin/gh-inbox diff <repo> <num>
@@ -75,12 +90,14 @@ Diga o que já tinha sido apontado antes (`prev_state` no item) e concentre o
 review no que mudou depois. O campo `rerequested` diz se houve pedido formal ou se
 foram só commits novos.
 
-Item com `watched: true` veio do watch que o `review-profundo` registra depois de
-postar. O campo `motivo` diz o que o autor fez depois do review (`prev_at`):
+Item com `watched: true` veio do watch que a skill de review registrou depois de
+postar (a `review-profundo` faz isso sempre; outra skill precisa chamar
+`gh-inbox watch` no fim). O campo `motivo` diz o que o autor fez depois do review (`prev_at`):
 `commits`, `resposta` (comentário, review ou edição do corpo, **sem** commit — o
 diff vem vazio, então leia as respostas dele desde `prev_at`) ou
-`commits+resposta`. Depois do re-review postado, o `review-profundo` registra o
-watch de novo.
+`commits+resposta`. Depois do re-review postado, registre o watch de novo
+(`~/.claude/bin/gh-inbox watch <repo> <num> <COMMENTED|APPROVED>`), se a skill não
+tiver feito isso.
 
 ### `PRONTO` — seu PR aprovado, CI verde, sem thread aberta
 Não é review nem diagnóstico. É o sinal de que **a pessoa** pode mergear. Diga qual PR,
@@ -111,7 +128,7 @@ gh run view <run-id> --repo <repo> --log-failed
 
 ## 4. Ao terminar o review: widget de confirmação
 
-O `review-profundo` termina com um parecer em texto. **Não pare aí e não pergunte em
+A `<skill>` termina com um parecer em texto. **Não pare aí e não pergunte em
 prosa se pode postar.** Se `mcp__visualize__show_widget` estiver disponível, renderize
 um widget com:
 
@@ -143,7 +160,7 @@ Depois de postar, confirme em uma linha com o link dos comentários criados.
 ## Regras que não se relaxam
 
 - **Nunca aprovar, nunca mergear.** Entregue o parecer; approve/merge é da pessoa.
-- **Nunca postar comentário no PR sem o OK explícito.** O `review-profundo`
+- **Nunca postar comentário no PR sem o OK explícito.** A `<skill>`
   roda, o resultado vira o widget de confirmação da seção 4, e só vai pro PR quando houver o clique. Pedir o review não é autorizar comentário.
 - **Não commitar sem explicar o diff antes** (vale para `MEU_PR`).
 - Idioma: comentário de PR segue o padrão do repo.

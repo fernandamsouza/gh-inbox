@@ -398,11 +398,11 @@ fi
 # review_requested sofre do MESMO problema, so que sem texto pra checar: o
 # pedido de review fica registrado no timeline (evento "review_requested"),
 # e qualquer comentario/review depois disso tambem bate o updated_at da
-# thread sem gerar pedido novo nenhum — visto no data-collection#7038: pedida
-# as 17:26, PR recebeu 8 comentarios/reviews ate 19:47, e a notificacao das
-# 19:47 (que era so o comentario do iagodvsantos) ainda chegou rotulada
-# "review pedido". Por isso o terceiro parametro ($3=1) soma essa 4a fonte —
-# so pedido quem chamou com reason=review_requested paga a chamada extra.
+# thread sem gerar pedido novo nenhum — visto num PR real: pedida as 17:26,
+# PR recebeu 8 comentarios/reviews ate 19:47, e a notificacao das 19:47 (que
+# era so o comentario de outro revisor) ainda chegou rotulada "review pedido".
+# Por isso o terceiro parametro ($3=1) soma essa 4a fonte — so paga a chamada
+# extra quem chamou com reason=review_requested.
 ultima_atividade() {  # repo, num, [com_pedido=0/1] -> "kind\tmarcou(true/false)"
   local rev rev_t rev_rest rev_state rev_marcou
   local com com_t com_marcou
