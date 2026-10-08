@@ -4,10 +4,12 @@ https://github.com/user-attachments/assets/76c4ed73-9f4b-4137-82e8-56af2e0ab86c
 
 Para de abrir o GitHub para *descobrir* o que precisa de você.
 
-Um poller local avisa em ≤60s quando pedem seu review, te marcam ou mexem no seu PR.
-O banner é clicável e vai direto pro PR; o que você não viu na hora fica na Central de
-Notificações. E a skill `/inbox` mostra a fila já classificada, com um botão que dispara
-o review no PR que você escolher.
+Um poller local avisa em ≤60s quando pedem seu review, te marcam, comentam em thread
+sua, mexem no seu PR ou te atribuem algo. Depois que você revisa, o **watch** avisa
+quando o autor responde ao seu review — comentário, review, edição do corpo ou commit
+novo. O banner é clicável e vai direto pro PR; o que você não viu na hora fica na
+Central de Notificações. E a skill `/inbox` mostra a fila já classificada, com um botão
+que dispara o review no PR que você escolher.
 
 **A parte que roda 24/7 custa zero.** Triagem e notificação são shell puro — `gh`, `jq`
 e `curl`. Nenhum token de LLM é gasto até você escolher um PR para revisar.
@@ -15,7 +17,7 @@ e `curl`. Nenhum token de LLM é gasto até você escolher um PR para revisar.
 ## Instalar
 
 ```bash
-git clone <este-repo> && cd gh-inbox && ./install.sh
+git clone https://github.com/fernandamsouza/gh-inbox && cd gh-inbox && ./install.sh
 ```
 
 Precisa de **macOS**, [`gh`](https://cli.github.com) autenticado e `jq`. O instalador
@@ -86,7 +88,7 @@ o histórico é preenchido.
 | `gh-inbox scan` | recoleta e reclassifica |
 | `gh-inbox digest` | só o que é novo desde a última vez (exit 1 se nada) |
 | `gh-inbox diff <repo> <n>` | no re-review: só o delta desde o seu último review |
-| `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner |
+| `gh-inbox watch <repo> <n> [estado]` | depois de revisar: vigia a resposta do autor (commit, comentário, review ou edição do corpo) e avisa por banner. **Não liga sozinho**: rode à mão ou chame no fim da sua skill de review — o botão Revisar não registra o watch |
 | `gh-inbox watching` / `unwatch <repo> <n>` | lista os PRs vigiados / para de vigiar (mergeado ou fechado sai sozinho) |
 | `gh-inbox mark` / `seed` | marca como visto / baseline inicial |
 
@@ -161,8 +163,9 @@ só polui.
 exatamente a cadência do LaunchAgent. Medido: 3 polls consecutivos, rate limit
 inalterado.
 
-O scan de estado (3 queries GraphQL) roda a cada 10 ticks, porque **CI vermelho não
-gera notificação no GitHub** — só aparece consultando estado.
+O scan de estado (3 queries GraphQL, mais 1 para os PRs em watch quando houver algum)
+roda a cada 10 ticks, porque **CI vermelho não gera notificação no GitHub** — só aparece
+consultando estado. A resposta do autor a um PR em watch também é detectada aqui.
 
 ## Evento não é estado
 
@@ -268,7 +271,8 @@ poll acontece quando ela volta.
 
 ## O botão Revisar
 
-Some `review_requested` no banner mostra um botão **Revisar**. O clique roda
+O botão **Revisar** aparece em dois banners: `review_requested` e resposta do autor a
+um PR em watch. O clique roda
 `gh-inbox-review <repo> <num>`, que:
 
 1. busca PR e diff via `gh` (sem clonar o repo)
